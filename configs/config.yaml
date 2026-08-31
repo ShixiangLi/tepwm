@@ -1,0 +1,30 @@
+data:
+  seed: 42
+  backend: python
+  operating_mode: 1
+  warmup_hours: 0.0
+  duration_hours: 1.0
+
+  # 可由上层规划器独立设定的SP，使用TEP的一基编号。
+  action_sp_numbers: [5, 7, 8, 11, 13, 14, 15, 17, 18, 19, 20]
+
+  # 事件在指定时刻生效并保持，时间单位均为小时。
+  mode_events: []
+  action_events: []
+  disturbance_events: []
+
+  # 训练数据运行边界；为空时只记录TEP自身的停车结果。
+  # 示例：{XMEAS7: [2500.0, 2900.0], XMEAS9: [110.0, 130.0]}
+  safety_limits: {}
+  boundary_margin_fraction: 0.05
+
+  # 示例：
+  # mode_events:
+  #   - {time_hours: 0.50, mode: 2}
+  # action_events:
+  #   - time_hours: 0.25
+  #     values: {SP18: 123.0, SP20: 0.84}
+  # disturbance_events:
+  #   - {time_hours: 0.75, idv: 1, value: 1}
+
+  output_dir: datasets

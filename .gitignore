@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Environments and editors
+.venv/
+.env
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Reproducible research artifacts (kept locally, not committed)
+datasets/
+checkpoints/
+results/
+*.pt
+*.pth
+*.npz
+*.tar
+
+# Runtime and temporary files
+*.log
+*.tmp
+*.bak
+_ddp_benchmark*/
+build/
+dist/
+*.egg-info/
