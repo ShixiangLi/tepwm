@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from pathlib import Path
-
 import numpy as np
 import pandas as pd
 import torch
@@ -211,8 +210,9 @@ def evaluate_planning_tasks(
     task_count = None if task_count is None else int(task_count)
     goal_minutes = int(settings.get("goal_offset_minutes", 30))
     steps_per_control = int(settings.get("simulator_steps_per_control", 60))
-    success_fraction = float(settings.get("success_fraction", 0.25))
-    if (task_count is not None and task_count < 1) or goal_minutes < 1 or not 0 < success_fraction < 1:
+    replan_every = int(settings.get("replan_every", 1))
+    success_threshold = float(settings.get("success_mse_threshold", 0.10))
+    if (task_count is not None and task_count < 1) or goal_minutes < 1 or success_threshold <= 0:
         raise ValueError("invalid planning evaluation settings")
 
     root = Path(dataset_dir)
@@ -229,8 +229,7 @@ def evaluate_planning_tasks(
         raise ValueError("no valid held-out action trajectory is available")
 
     planner = build_cem_planner(
-        checkpoint_path, config, device=device, **(planner_overrides or {})
-    )
+        checkpoint_path, config, device=device, **(planner_overrides or {}))
     rows, cases = [], []
     history_size = int(planner.model.history_size)
     sample_stride = int(config["training"].get("sample_stride_steps", 60))
@@ -254,6 +253,7 @@ def evaluate_planning_tasks(
             actions[history_indices[:-1]], observations[goal],
             control_steps=control_steps,
             simulator_steps_per_control=steps_per_control,
+            replan_every=replan_every,
         )
         reference_indices = start + np.arange(control_steps + 1) * steps_per_control
         reference_action_indices = reference_indices[:-1]
@@ -264,7 +264,7 @@ def evaluate_planning_tasks(
             result["observations"][-1], observations[goal], planner.stats
         )
         improvement = 1.0 - final_error / max(initial_error, 1e-12)
-        success = bool(result["alive"] and final_error <= success_fraction * initial_error)
+        success = bool(result["alive"] and final_error <= success_threshold)
         row = {
             "trajectory_id": record["trajectory_id"],
             "scenario_type": record["scenario_type"],
@@ -289,13 +289,13 @@ def evaluate_planning_tasks(
     if not rows:
         raise ValueError("no trajectory is long enough for the configured planning task")
     per_task = pd.DataFrame(rows)
-    summary = _planning_summary(per_task, success_fraction)
-    successful = [case for case in cases if case["success"]]
-    pool = successful or cases
+    summary = _planning_summary(per_task, success_threshold)
+    pool = [case for case in cases if case["success"]] or cases
     typical = min(pool, key=lambda case: abs(
         case["improvement"] - np.median([item["improvement"] for item in pool])
     ))
-    return {"summary": summary, "per_task": per_task, "typical_case": typical}
+    return {"summary": summary, "per_task": per_task,
+            "typical_case": typical, "cases": cases}
 
 
 def _replay_generator(data_config, record, actions, stop_step) -> TEPDataGenerator:
@@ -331,7 +331,7 @@ def _planning_summary(per_task: pd.DataFrame, threshold: float) -> pd.DataFrame:
         "initial_xmeas_mse": group["initial_xmeas_mse"].mean(),
         "final_xmeas_mse": group["final_xmeas_mse"].mean(),
         "mean_improvement": group["improvement"].mean(),
-        "success_fraction": threshold,
+        "success_mse_threshold": threshold,
     } for name, group in groups])
 
 

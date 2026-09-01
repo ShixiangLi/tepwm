@@ -141,12 +141,17 @@ evaluation:
   batch_size: 256
 
 planning:
-  horizon: 10
+  horizon: 30
   num_samples: 512
   num_elites: 64
   iterations: 5
   momentum: 0.10
   min_std_fraction: 0.01
+  initial_std_fraction: 0.15
+  action_block_size: 10
+  max_changed_actions: 3
+  max_action_delta_fraction: 0.20
+  action_change_weight: 0.05
   seed: 42
   # 测试集任务：从首个动作时刻出发，以30分钟后的真实状态作为可达目标。
   split: test
@@ -154,5 +159,6 @@ planning:
   num_tasks: null  # null表示评估全部满足条件的测试任务。
   goal_offset_minutes: 30
   simulator_steps_per_control: 60
-  # 最终标准化XMEAS误差不超过初始误差的25%，即至少改善75%，记为成功。
-  success_fraction: 0.25
+  replan_every: 5
+  # 未停机且最终标准化XMEAS MSE不超过该绝对阈值，记为成功。
+  success_mse_threshold: 0.10
