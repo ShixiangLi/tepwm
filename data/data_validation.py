@@ -20,7 +20,7 @@ def validate_trajectory(
     expected_duration_hours: float | None = None,
     require_complete: bool = True,
 ) -> dict[str, Any]:
-    """Run the structural quality gate used before dataset admission."""
+    """执行轨迹入库前的维度、数值、时序和完整性质量检查。"""
     steps = len(trajectory.actions)
     expected_shapes = {
         "time": (steps + 1,),
@@ -80,7 +80,7 @@ def classify_trajectory_outcome(
     terminated_early: bool,
     boundary_margin_fraction: float = 0.05,
 ) -> tuple[str, dict[str, int]]:
-    """Label a trajectory as normal, boundary, exceeded, recovered or shutdown."""
+    """依据安全边界和停车状态标注轨迹结局并返回超限详情。"""
     if not isinstance(safety_limits, Mapping):
         raise TypeError("safety_limits must be a mapping")
     if not 0.0 <= boundary_margin_fraction < 0.5:
@@ -127,7 +127,7 @@ def summarize_action_coverage(
     trajectories: Sequence[Trajectory],
     expected_sp_numbers: Sequence[int] = DEFAULT_ACTION_SP_NUMBERS,
 ) -> dict[str, Any]:
-    """Summarize action coverage across a dataset rather than per trajectory."""
+    """在数据集层面统计每个动作SP的变化次数和总体覆盖率。"""
     expected = tuple(int(number) for number in expected_sp_numbers)
     if not expected or len(set(expected)) != len(expected):
         raise ValueError("expected_sp_numbers must be non-empty and unique")
@@ -148,6 +148,7 @@ def summarize_action_coverage(
 
 
 def _parse_xmeas_number(value: int | str) -> int:
+    """将整数或XMEAS7形式的标识统一解析为测量变量编号。"""
     if isinstance(value, str):
         value = value.upper().removeprefix("XMEAS")
     try:

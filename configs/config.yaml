@@ -15,7 +15,12 @@ data:
 
   # 训练数据运行边界；为空时只记录TEP自身的停车结果。
   # 示例：{XMEAS7: [2500.0, 2900.0], XMEAS9: [110.0, 130.0]}
-  safety_limits: {}
+  safety_limits:
+    XMEAS7: [2500.0, 2900.0]
+    XMEAS8: [20.0, 80.0]
+    XMEAS9: [110.0, 130.0]
+    XMEAS12: [20.0, 80.0]
+    XMEAS15: [20.0, 80.0]
   boundary_margin_fraction: 0.05
 
   # 示例：
@@ -28,3 +33,126 @@ data:
   #   - {time_hours: 0.75, idv: 1, value: 1}
 
   output_dir: datasets
+
+  generation:
+    seed: 2026
+    dataset_name: tep_world_model_v1
+    num_trajectories: 300
+    counterfactual_pairs: 30
+    num_workers: 8  # 按轨迹并行；内存或磁盘压力较大时可调低。
+    compress: false  # 关闭压缩可加快保存，但会增加磁盘占用。
+    # 当前仿真器只有一套基准稳态内部状态；3/6仅用于切换或越界轨迹，
+    # 不作为需要长时间预热的初始稳态工况。
+    operating_modes: [1, 2, 4, 5]
+    warmup_minutes: [120, 240]
+
+    # 基础场景占比；反事实轨迹对在此基础上额外生成。
+    scenario_proportions:
+      fixed_sp: 0.15
+      single_action: 0.20
+      multi_action: 0.40
+      disturbance: 0.25
+
+    duration_minutes:
+      fixed_sp: [60, 180]
+      single_action: [180, 300]
+      multi_action: [240, 480]
+      disturbance: [240, 480]
+
+    split_ratios:
+      train: 0.80
+      validation: 0.10
+      test: 0.10
+
+    action:
+      first_event_minutes: [20, 40]
+      hold_minutes: [20, 60]
+      final_context_minutes: 30
+      multi_event_count: [2, 6]
+      sp_per_event: [1, 3]
+      restore_probability: 0.20
+      # 少量动作采到允许范围边缘，用于形成近边界和超限样本。
+      boundary_probability: 0.10
+      boundary_band_fraction: 0.05
+      # 相对于每个SP允许范围的阶跃比例。
+      step_fraction: [0.10, 0.35]
+      bounds:
+        SP5: [24.0, 30.0]
+        SP7: [35.0, 65.0]
+        SP8: [35.0, 65.0]
+        SP11: [20.0, 26.0]
+        SP13: [28.0, 36.0]
+        SP14: [5.5, 8.0]
+        SP15: [16.0, 22.0]
+        SP17: [55.0, 75.0]
+        SP18: [118.0, 130.0]
+        SP19: [11.0, 16.0]
+        SP20: [0.75, 0.90]
+
+    disturbance:
+      idvs: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+      idv_count: [1, 2]
+      start_minutes: [30, 60]
+      active_minutes: [30, 120]
+      final_context_minutes: 30
+      action_overlay_probability: 0.50
+
+# LeWM核心结构：状态编码器 + 动作条件自回归Transformer。
+model:
+  observation_dim: 53
+  action_dim: 11
+  latent_dim: 128
+  state_hidden_dim: 256
+  projector_hidden_dim: 512
+  history_size: 8
+  predictor_depth: 4
+  predictor_heads: 8
+  predictor_dim_head: 16
+  predictor_mlp_dim: 512
+  dropout: 0.10
+
+training:
+  dataset_dir: datasets/tep_full_20260831_224546
+  train_split: train
+  validation_split: validation
+  # 原始数据为1秒采样；每60步取样一次，形成8分钟历史窗口。
+  sample_stride_steps: 60
+  window_stride_steps: 60
+  preload: true
+  # 单卡批量大小；DDP全局批量大小 = batch_size × GPU数量。
+  batch_size: 256
+  loader_workers: 0
+  epochs: 100
+  warmup_epochs: 5
+  learning_rate: 0.00005
+  weight_decay: 0.001
+  gradient_clip: 1.0
+  sigreg_weight: 0.09
+  sigreg_knots: 17
+  sigreg_projections: 1024
+  seed: 3072
+  device: auto
+  output_dir: checkpoints/tep_lewm_v1
+
+evaluation:
+  split: test
+  scenario_types: [single_action, multi_action]
+  horizons: [1, 5, 10, 30]
+  batch_size: 256
+
+planning:
+  horizon: 10
+  num_samples: 512
+  num_elites: 64
+  iterations: 5
+  momentum: 0.10
+  min_std_fraction: 0.01
+  seed: 42
+  # 测试集任务：从首个动作时刻出发，以30分钟后的真实状态作为可达目标。
+  split: test
+  scenario_types: [single_action, multi_action]
+  num_tasks: null  # null表示评估全部满足条件的测试任务。
+  goal_offset_minutes: 30
+  simulator_steps_per_control: 60
+  # 最终标准化XMEAS误差不超过初始误差的25%，即至少改善75%，记为成功。
+  success_fraction: 0.25

@@ -39,23 +39,27 @@ class Trajectory:
 
     @property
     def measurements(self) -> np.ndarray:
+        """返回观测中的41维过程测量量XMEAS。"""
         return self.observations[:, :41]
 
     @property
     def manipulated_vars(self) -> np.ndarray:
+        """返回观测中的12维实际操纵量XMV。"""
         return self.observations[:, 41:]
 
     @property
     def trajectory_type(self) -> str:
+        """返回轨迹类型标签，如fixed_sp、action或disturbance。"""
         return str(self.metadata["trajectory_type"])
 
     @property
     def outcome(self) -> str:
+        """返回轨迹结局标签，如normal、boundary、violation或shutdown。"""
         return str(self.metadata["outcome"])
 
 
 def load_data_config(path: str | Path = "configs/config.yaml") -> dict[str, Any]:
-    """Load the ``data`` section of the project configuration."""
+    """读取YAML配置并返回其中的data配置段。"""
     with Path(path).open("r", encoding="utf-8") as file:
         config = yaml.safe_load(file) or {}
     data_config = config.get("data")
@@ -69,7 +73,8 @@ class TEPDataGenerator:
 
     dt_hours = SAMPLE_INTERVAL_HOURS
 
-    def __init__(self, config: Mapping[str, Any]):
+    def __init__(self, config: Mapping[str, Any], *, initialize: bool = True):
+        """保存生成配置、校验动作空间，并按需创建仿真器。"""
         self.config = dict(config)
         self.seed = int(self.config.get("seed", 42))
         self.backend = str(self.config.get("backend", "python"))
@@ -86,10 +91,12 @@ class TEPDataGenerator:
         if any(number < 1 or number > 20 for number in self.action_sp_numbers):
             raise ValueError("action SP numbers must be between 1 and 20")
         self.simulator: TEPSimulator | None = None
-        self.reset()
+        if initialize:
+            self.reset()
 
     @property
     def controller(self):
+        """返回当前闭环控制器，并阻止在初始化前访问。"""
         if self.simulator is None:
             raise RuntimeError("generator is not initialized")
         return self.simulator.controller
@@ -100,7 +107,7 @@ class TEPDataGenerator:
         operating_mode: int | None = None,
         warmup_hours: float | None = None,
     ) -> np.ndarray:
-        """Create a fresh simulator and optionally warm it up without recording."""
+        """重建仿真器、设置初始工况并执行不记录数据的预热。"""
         self.seed = self.seed if seed is None else int(seed)
         mode = int(
             self.config.get("operating_mode", 1)
@@ -122,8 +129,11 @@ class TEPDataGenerator:
             control_mode=ControlMode.CLOSED_LOOP,
             backend=self.backend,
         )
+        # 仿真器对所有工况都从同一套内置基准物理状态开始。
         self.simulator.initialize()
+        # 工况切换只更新控制器SP，不会替换反应器等内部物理状态。
         self.switch_operating_mode(mode)
+        # 预热既消除初始瞬态，也验证该起点能否安全到达目标工况。
         warmup_steps = round(warmup / self.dt_hours)
         if warmup_steps and not self.simulator.step(warmup_steps):
             raise RuntimeError("TEP shut down during warmup")
@@ -132,7 +142,7 @@ class TEPDataGenerator:
     def switch_operating_mode(
         self, mode: int, preserve_actions: bool = False
     ) -> np.ndarray:
-        """Change mode setpoints without resetting the current process state."""
+        """保持内部物理状态不变，仅切换工况对应的控制器SP。"""
         previous_action = self.get_action() if preserve_actions else None
         self.controller.set_mode(int(mode))
         self._sync_all_setpoints()
@@ -141,7 +151,7 @@ class TEPDataGenerator:
         return self.get_action()
 
     def get_action(self) -> np.ndarray:
-        """Return the configured external SP action vector."""
+        """按配置顺序读取世界模型使用的外部SP动作向量。"""
         return np.asarray(
             [
                 getattr(self.controller, _SP_TO_CONTROLLER[number]).setpoint
@@ -151,7 +161,7 @@ class TEPDataGenerator:
         )
 
     def set_action(self, action: Sequence[float]) -> np.ndarray:
-        """Set every SP in the configured action vector."""
+        """一次设置完整SP动作向量，并校验维度与数值有效性。"""
         values = np.asarray(action, dtype=np.float64).reshape(-1)
         expected_shape = (len(self.action_sp_numbers),)
         if values.shape != expected_shape:
@@ -163,7 +173,7 @@ class TEPDataGenerator:
         return self.get_action()
 
     def update_action(self, changes: Mapping[int | str, float]) -> np.ndarray:
-        """Update selected SPs while leaving the other action values unchanged."""
+        """只修改指定SP，其余动作分量保持当前值。"""
         if not isinstance(changes, Mapping) or not changes:
             raise ValueError("action changes must be a non-empty mapping")
         action = self.get_action()
@@ -178,7 +188,7 @@ class TEPDataGenerator:
         return self.set_action(action)
 
     def set_disturbance(self, idv_index: int, value: int = 1) -> None:
-        """Turn one TEP disturbance on or off."""
+        """打开或关闭一个一基编号的TEP干扰变量IDV。"""
         if int(idv_index) not in range(1, 21):
             raise ValueError("idv_index must be between 1 and 20")
         if int(value) not in (0, 1):
@@ -186,10 +196,11 @@ class TEPDataGenerator:
         self.simulator.set_disturbance(int(idv_index), int(value))
 
     def clear_disturbances(self) -> None:
+        """关闭当前仿真器中的全部干扰。"""
         self.simulator.clear_disturbances()
 
     def step(self, action: Sequence[float] | None = None) -> dict[str, Any]:
-        """Apply an optional action and advance one causal transition."""
+        """可选地施加动作，并推进一个因果对齐的状态转移。"""
         observation = self._observation()
         if action is not None:
             self.set_action(action)
@@ -211,7 +222,7 @@ class TEPDataGenerator:
     def generate_trajectory(
         self, config: Mapping[str, Any] | None = None
     ) -> Trajectory:
-        """Generate one variable-duration trajectory from declarative events."""
+        """按时间事件执行仿真，生成一条可变时长的完整轨迹。"""
         trajectory_config = {**self.config, **dict(config or {})}
         duration = float(trajectory_config.get("duration_hours", 1.0))
         if duration <= 0:
@@ -318,17 +329,20 @@ class TEPDataGenerator:
         )
 
     def _observation(self) -> np.ndarray:
+        """拼接XMEAS和XMV，形成世界模型的53维观测状态。"""
         return np.concatenate(
             [self.simulator.get_measurements(), self.simulator.get_manipulated_vars()]
         ).astype(np.float64, copy=False)
 
     def _sync_all_setpoints(self) -> None:
+        """将控制器SP数组同步到各个实际PI控制回路。"""
         for number, controller_name in _SP_TO_CONTROLLER.items():
             getattr(self.controller, controller_name).setpoint = float(
                 self.controller.setpoints[number - 1]
             )
 
     def _set_setpoint(self, number: int, value: float) -> None:
+        """同时更新一个SP的统一存储值与对应控制回路。"""
         self.controller.setpoints[number - 1] = value
         getattr(self.controller, _SP_TO_CONTROLLER[number]).setpoint = value
 
@@ -338,6 +352,7 @@ class TEPDataGenerator:
         duration_hours: float,
         event_name: str,
     ) -> dict[int, list[Mapping[str, Any]]]:
+        """校验事件时间，并按一秒采样步索引对事件分组。"""
         grouped: dict[int, list[Mapping[str, Any]]] = defaultdict(list)
         for event in events:
             if not isinstance(event, Mapping) or "time_hours" not in event:
@@ -355,6 +370,7 @@ class TEPDataGenerator:
 
     @staticmethod
     def _parse_sp_number(value: int | str) -> int:
+        """将整数或SP18形式的标识统一解析为SP编号。"""
         if isinstance(value, str):
             value = value.upper().removeprefix("SP")
         try:
