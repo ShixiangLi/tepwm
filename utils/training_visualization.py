@@ -30,9 +30,15 @@ def plot_training_history(
     if sigreg_weight < 0:
         raise ValueError("sigreg_weight must be non-negative")
 
-    best = frame.loc[frame["validation_loss"].idxmin()]
+    selection_column = (
+        "validation_rollout_loss"
+        if "validation_rollout_loss" in frame else "validation_prediction_loss"
+    )
+    best = frame.loc[frame[selection_column].idxmin()]
     summary = {
         "best_epoch": int(best["epoch"]),
+        "checkpoint_metric": selection_column,
+        "best_checkpoint_metric": float(best[selection_column]),
         "best_validation_loss": float(best["validation_loss"]),
         "best_validation_prediction_loss": float(best["validation_prediction_loss"]),
     }
@@ -48,11 +54,15 @@ def plot_training_history(
     components = (
         ("train_prediction_loss", "Train prediction", "-"),
         ("validation_prediction_loss", "Validation prediction", "--"),
+        ("train_rollout_loss", "Train rollout", "-"),
+        ("validation_rollout_loss", "Validation rollout", "--"),
         ("train_sigreg_loss", "Train weighted SIGReg", "-"),
         ("validation_sigreg_loss", "Validation weighted SIGReg", "--"),
     )
-    colors = ("#0072B2", "#0072B2", "#009E73", "#009E73")
-    for (column, label, style), color in zip(components, colors):
+    components = tuple(item for item in components if item[0] in frame)
+    colors = {"prediction": "#0072B2", "rollout": "#D55E00", "sigreg": "#009E73"}
+    for column, label, style in components:
+        color = next(value for key, value in colors.items() if key in column)
         values = frame[column] * sigreg_weight if "sigreg" in column else frame[column]
         axes[1].plot(frame["epoch"], values, label=label, linestyle=style, color=color)
     axes[1].set(title="Loss Components", xlabel="Epoch", ylabel="Contribution")

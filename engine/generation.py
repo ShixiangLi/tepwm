@@ -1,21 +1,17 @@
 """Configuration-driven batch generation for TEP world-model datasets."""
-
 from __future__ import annotations
-
 import hashlib
 import json
+import shutil
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Any
-
 import numpy as np
 from tqdm.auto import tqdm
-
 from data.data_gen import TEPDataGenerator, Trajectory
 from data.data_validation import validate_trajectory
-
 SCENARIO_TYPES = ("fixed_sp", "single_action", "multi_action", "disturbance")
 
 
@@ -106,8 +102,6 @@ def build_generation_plan(
                 )
             )
     return plans
-
-
 def generate_dataset(
     data_config: Mapping[str, Any],
     *,
@@ -117,19 +111,26 @@ def generate_dataset(
     show_progress: bool = True,
     num_workers: int | None = None,
     compress: bool | None = None,
+    overwrite: bool | None = None,
 ) -> dict[str, Any]:
-    """执行全部计划，验证并保存一个不可覆盖的数据集版本。"""
+    """执行全部计划、验证轨迹，并保存到配置指定的数据集目录。"""
     data = dict(data_config)
     generation = data["generation"]
     workers = int(generation.get("num_workers", 1) if num_workers is None else num_workers)
     compressed = bool(generation.get("compress", True) if compress is None else compress)
+    replace = bool(generation.get("overwrite", False) if overwrite is None else overwrite)
     if workers < 1:
         raise ValueError("num_workers must be positive")
     plans = build_generation_plan(data, num_trajectories, counterfactual_pairs)
     target = Path(output_dir) if output_dir is not None else Path(data.get(
         "output_dir", "datasets")) / str(generation.get("dataset_name", "tep_world_model"))
     if target.exists() and (not target.is_dir() or any(target.iterdir())):
-        raise FileExistsError(f"dataset directory is not empty: {target}")
+        if not replace or not target.is_dir():
+            raise FileExistsError(f"dataset directory is not empty: {target}")
+        resolved = target.resolve()
+        if resolved == Path.cwd().resolve() or resolved == Path(resolved.anchor):
+            raise ValueError(f"refusing to replace unsafe dataset path: {resolved}")
+        shutil.rmtree(resolved)
     trajectory_dir = target / "trajectories"
     trajectory_dir.mkdir(parents=True, exist_ok=True)
     tasks = [(plan, trajectory_dir, target, compressed) for plan in plans]
@@ -159,8 +160,6 @@ def generate_dataset(
                             encoding="utf-8")
     return {"output_dir": target, "manifest_path": manifest_path,
             "summary_path": summary_path, "records": records, "summary": summary}
-
-
 def _generate_one(task):
     """生成、验证并保存一条轨迹，供串行或多进程执行。"""
     plan, trajectory_dir, root, compressed = task

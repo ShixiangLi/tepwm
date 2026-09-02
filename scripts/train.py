@@ -30,9 +30,12 @@ def main() -> None:
     args = parse_args()
     with args.config.open("r", encoding="utf-8") as file:
         config = yaml.safe_load(file)
+    dataset_dir = args.dataset_dir or Path(config["training"]["dataset_dir"])
+    if not dataset_dir.is_absolute():
+        dataset_dir = PROJECT_ROOT / dataset_dir
     result = train_world_model(
         config,
-        dataset_dir=args.dataset_dir,
+        dataset_dir=dataset_dir,
         device=args.device,
         max_epochs=args.epochs,
     )

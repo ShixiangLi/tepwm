@@ -40,6 +40,11 @@ def train_world_model(
     is_main = rank == 0
     seed = int(training.get("seed", 42))
     _set_seed(seed + rank)
+    rollout_horizons = tuple(sorted(set(map(
+        int, training.get("rollout_horizons", [5, 10, 30])
+    ))))
+    if not rollout_horizons or rollout_horizons[0] < 1:
+        raise ValueError("training rollout horizons must be positive")
     if device_obj.type == "cuda":
         torch.set_float32_matmul_precision("high")
 
@@ -51,6 +56,7 @@ def train_world_model(
     dataset_options = {
         "stats": stats,
         "history_size": int(model_config["history_size"]),
+        "rollout_horizon": max(rollout_horizons),
         "sample_stride_steps": stride,
         "window_stride_steps": int(training.get("window_stride_steps", stride)),
         "preload": bool(training.get("preload", True)),
@@ -89,6 +95,7 @@ def train_world_model(
         model = DistributedDataParallel(model, device_ids=device_ids)
     criterion = LeWMLoss(
         sigreg_weight=float(training.get("sigreg_weight", 0.09)),
+        rollout_weight=float(training.get("rollout_weight", 1.0)),
         knots=int(training.get("sigreg_knots", 17)),
         num_proj=int(training.get("sigreg_projections", 1024)),
     ).to(device_obj)
@@ -115,6 +122,13 @@ def train_world_model(
         "global_batch_size": per_device_batch * world_size,
     }
     history, best_validation = [], float("inf")
+    checkpoint_metric = str(training.get("checkpoint_metric", "rollout_loss"))
+    if checkpoint_metric not in {"prediction_loss", "rollout_loss"}:
+        raise ValueError("checkpoint_metric must be prediction_loss or rollout_loss")
+    checkpoint_training.update({
+        "rollout_horizons": list(rollout_horizons),
+        "checkpoint_metric": checkpoint_metric,
+    })
     for epoch in range(1, epochs + 1):
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
@@ -122,11 +136,13 @@ def train_world_model(
             model, criterion, train_loader, device_obj,
             optimizer=optimizer, scheduler=scheduler,
             gradient_clip=float(training.get("gradient_clip", 1.0)),
+            rollout_horizons=rollout_horizons,
             description=f"Epoch {epoch}/{epochs} train",
             show_progress=is_main,
         )
         validation_metrics = _run_epoch(
             model, criterion, val_loader, device_obj,
+            rollout_horizons=rollout_horizons,
             description=f"Epoch {epoch}/{epochs} validation",
             show_progress=is_main,
         )
@@ -142,8 +158,8 @@ def train_world_model(
                 checkpoint_training, stats.to_dict(), history,
             )
             torch.save(checkpoint, output_dir / "last.pt")
-            if validation_metrics["loss"] < best_validation:
-                best_validation = validation_metrics["loss"]
+            if validation_metrics[checkpoint_metric] < best_validation:
+                best_validation = validation_metrics[checkpoint_metric]
                 torch.save(checkpoint, output_dir / "best.pt")
             (output_dir / "history.json").write_text(
                 json.dumps(history, indent=2) + "\n", encoding="utf-8"
@@ -161,6 +177,8 @@ def train_world_model(
         "world_size": world_size,
         "per_device_batch_size": per_device_batch,
         "global_batch_size": per_device_batch * world_size,
+        "checkpoint_metric": checkpoint_metric,
+        "best_validation_metric": best_validation,
     }
     if distributed:
         dist.barrier()
@@ -188,20 +206,30 @@ def _run_epoch(
     optimizer: torch.optim.Optimizer | None = None,
     scheduler: torch.optim.lr_scheduler.LRScheduler | None = None,
     gradient_clip: float = 1.0,
+    rollout_horizons: tuple[int, ...] = (1,),
     description: str = "",
     show_progress: bool = True,
 ) -> dict[str, float]:
     """Run an epoch and aggregate sample-weighted metrics across all ranks."""
     is_training = optimizer is not None
     model.train(is_training)
-    totals = {"loss": 0.0, "prediction_loss": 0.0, "sigreg_loss": 0.0}
+    totals = {
+        "loss": 0.0, "prediction_loss": 0.0,
+        "rollout_loss": 0.0, "sigreg_loss": 0.0,
+    }
     sample_count = 0
     progress = tqdm(
         loader, desc=description, unit="batch", leave=False, disable=not show_progress
     )
-    for batch in progress:
+    for batch_index, batch in enumerate(progress):
         observations = batch["observations"].to(device, non_blocking=True)
         actions = batch["actions"].to(device, non_blocking=True)
+        future_actions = batch["future_actions"].to(device, non_blocking=True)
+        rollout_targets = batch["rollout_targets"].to(device, non_blocking=True)
+        active_horizons = (
+            (rollout_horizons[batch_index % len(rollout_horizons)],)
+            if is_training else rollout_horizons
+        )
         batch_size = len(observations)
         if is_training:
             optimizer.zero_grad(set_to_none=True)
@@ -211,7 +239,11 @@ def _run_epoch(
                 dtype=torch.bfloat16,
                 enabled=device.type == "cuda" and torch.cuda.is_bf16_supported(),
             ):
-                losses = criterion(model(observations, actions))
+                output = model(
+                    observations, actions, future_actions,
+                    rollout_targets, active_horizons,
+                )
+                losses = criterion(output)
             if is_training:
                 losses["loss"].backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip)

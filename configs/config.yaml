@@ -36,7 +36,8 @@ data:
 
   generation:
     seed: 2026
-    dataset_name: tep_world_model_v1
+    dataset_name: tep_latest
+    overwrite: true  # 每次完整生成替换固定的latest目录。
     num_trajectories: 300
     counterfactual_pairs: 30
     num_workers: 8  # 按轨迹并行；内存或磁盘压力较大时可调低。
@@ -112,12 +113,16 @@ model:
   dropout: 0.10
 
 training:
-  dataset_dir: datasets/tep_full_20260831_224546
+  dataset_dir: datasets/tep_latest
   train_split: train
   validation_split: validation
   # 原始数据为1秒采样；每60步取样一次，形成8分钟历史窗口。
   sample_stride_steps: 60
   window_stride_steps: 60
+  # 训练时轮换优化5/10/30分钟latent rollout；验证同时评估三个时域。
+  rollout_horizons: [5, 10, 30]
+  rollout_weight: 1.0
+  checkpoint_metric: rollout_loss
   preload: true
   # 单卡批量大小；DDP全局批量大小 = batch_size × GPU数量。
   batch_size: 256
@@ -132,7 +137,7 @@ training:
   sigreg_projections: 1024
   seed: 3072
   device: auto
-  output_dir: checkpoints/tep_lewm_v1
+  output_dir: checkpoints/tep_lewm_multistep_v2
 
 evaluation:
   split: test
