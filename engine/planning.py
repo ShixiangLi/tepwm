@@ -1,20 +1,16 @@
 """LeWM-style latent CEM planning and receding-horizon TEP execution."""
-
 from __future__ import annotations
-
 from collections.abc import Mapping, Sequence
+import copy
 from pathlib import Path
-
 import numpy as np
 import torch
-
+from data.data_gen import TEPDataGenerator
+from data.data_validation import classify_trajectory_outcome
 from data.data_process import NormalizationStats
 from engine.training import load_checkpoint
-
-
 class CEMPlanner:
     """Search bounded SP sequences using terminal latent distance to the goal."""
-
     def __init__(
         self,
         model: torch.nn.Module,
@@ -48,7 +44,6 @@ class CEMPlanner:
         bounds = np.asarray(action_bounds, dtype=np.float32)
         if bounds.shape != (model.action_dim, 2) or np.any(bounds[:, 0] >= bounds[:, 1]):
             raise ValueError("action_bounds must have shape (action_dim, 2)")
-
         self.model = model.eval()
         self.stats = normalization
         self.device = next(model.parameters()).device
@@ -71,7 +66,6 @@ class CEMPlanner:
         self.max_action_delta_fraction = float(max_action_delta_fraction)
         self.action_change_weight = float(action_change_weight)
         self.generator = torch.Generator(device=self.device).manual_seed(int(seed))
-
     @torch.inference_mode()
     def plan(
         self,
@@ -97,7 +91,6 @@ class CEMPlanner:
             current = 0.5 * (self.physical_lower + self.physical_upper)
         if current.shape != (self.model.action_dim,):
             raise ValueError("initial_action has the wrong dimension")
-
         planning_horizon = self.horizon if horizon is None else int(horizon)
         if planning_horizon < 1 or planning_horizon > self.horizon:
             raise ValueError("horizon must be between 1 and the configured horizon")
@@ -112,7 +105,6 @@ class CEMPlanner:
         ).clone()
         minimum_std = self.min_std_fraction * action_range
         best_cost, best_actions = float("inf"), None
-
         for _ in range(self.iterations):
             noise = torch.randn(
                 self.num_samples, planning_horizon, self.model.action_dim,
@@ -144,7 +136,6 @@ class CEMPlanner:
             if float(iteration_cost) < best_cost:
                 best_cost = float(iteration_cost)
                 best_actions = candidates[int(iteration_index)].clone()
-
         assert best_actions is not None
         predicted = self.model.rollout(
             observations, past_actions, best_actions[None, None]
@@ -158,7 +149,6 @@ class CEMPlanner:
             "latent_cost": best_cost,
             "predicted_embeddings": predicted.cpu().numpy(),
         }
-
     def _constrain_candidates(
         self, candidates: torch.Tensor, current: torch.Tensor,
         action_range: torch.Tensor,
@@ -177,7 +167,6 @@ class CEMPlanner:
         mask = torch.zeros_like(scores).scatter_(1, changed, 1.0)
         candidates = current + delta * mask[:, None]
         return torch.maximum(torch.minimum(candidates, self.upper), self.lower)
-
     def _prepare_context(self, observations, actions) -> tuple[np.ndarray, np.ndarray]:
         """Validate and truncate a causally aligned raw state/action history."""
         observations = np.asarray(observations, dtype=np.float32)
@@ -192,16 +181,12 @@ class CEMPlanner:
         observations = observations[-steps:]
         actions = actions[-(steps - 1):] if steps > 1 else actions[:0]
         return observations, actions
-
     def _observation_tensor(self, values) -> torch.Tensor:
         values = self.stats.normalize_observations(np.asarray(values))
         return torch.as_tensor(values, dtype=torch.float32, device=self.device)
-
     def _action_tensor(self, values) -> torch.Tensor:
         values = self.stats.normalize_actions(np.asarray(values))
         return torch.as_tensor(values, dtype=torch.float32, device=self.device)
-
-
 def build_cem_planner(
     checkpoint_path: str | Path,
     config: Mapping,
@@ -229,8 +214,6 @@ def build_cem_planner(
     }
     options.update(overrides)
     return CEMPlanner(model, stats, bounds, **options)
-
-
 def run_tep_mpc(
     generator,
     planner: CEMPlanner,
@@ -286,4 +269,111 @@ def run_tep_mpc(
         "actions": np.asarray(executed_actions),
         "latent_costs": np.asarray(latent_costs),
         "alive": alive,
+    }
+def replay_tep_generator(
+    data_config: Mapping,
+    record: Mapping,
+    actions: np.ndarray,
+    stop_step: int,
+) -> tuple[TEPDataGenerator, np.ndarray]:
+    """Reconstruct a recorded simulator state before a planning task."""
+    generator = TEPDataGenerator({
+        **data_config,
+        "seed": int(record["seed"]),
+        "operating_mode": int(record["mode"]),
+        "warmup_hours": float(record["warmup_hours"]),
+        "action_events": [],
+        "mode_events": [],
+        "disturbance_events": [],
+    })
+    observation = generator.get_observation()
+    for step in range(int(stop_step)):
+        transition = generator.step(actions[step])
+        observation = np.asarray(transition["next_observation"]).copy()
+        if not transition["alive"]:
+            raise RuntimeError(
+                f"{record['trajectory_id']} shut down during replay"
+            )
+    return generator, observation
+def execute_action_sequence(
+    generator: TEPDataGenerator,
+    actions: np.ndarray,
+) -> dict[str, np.ndarray | bool]:
+    """Execute a one-second action sequence for oracle and hold baselines."""
+    observations = [generator.get_observation()]
+    alive = True
+    for action in np.asarray(actions):
+        transition = generator.step(action)
+        observations.append(
+            np.asarray(transition["next_observation"]).copy()
+        )
+        alive = bool(transition["alive"])
+        if not alive:
+            break
+    return {
+        "observations": np.asarray(observations),
+        "alive": alive,
+    }
+def standardized_xmeas_mse(
+    observation: np.ndarray,
+    goal: np.ndarray,
+    stats: NormalizationStats,
+) -> float:
+    """Measure goal error over the 41 standardized process measurements."""
+    difference = np.asarray(observation)[:41] - np.asarray(goal)[:41]
+    return float(np.mean(np.square(difference / stats.observation_std[:41])))
+def prepare_tep_planning_task(
+    data_config: Mapping,
+    record: Mapping,
+    observations: np.ndarray,
+    actions: np.ndarray,
+    start: int,
+    goal: int,
+    stats: NormalizationStats,
+    *,
+    success_threshold: float,
+    replay_threshold: float,
+    require_nontrivial: bool,
+) -> dict:
+    """Validate safety, replay fidelity, oracle reachability and task difficulty."""
+    outcome, _ = classify_trajectory_outcome(
+        observations[goal : goal + 1],
+        data_config.get("safety_limits", {}),
+        shutdown=False,
+        terminated_early=False,
+        boundary_margin_fraction=float(
+            data_config.get("boundary_margin_fraction", 0.05)
+        ),
+    )
+    if outcome == "limit_exceeded":
+        return {"valid": False, "reason": "unsafe_goal"}
+    planner_generator, replayed = replay_tep_generator(
+        data_config, record, actions, start
+    )
+    replay_error = standardized_xmeas_mse(replayed, observations[start], stats)
+    if replay_error > replay_threshold:
+        return {"valid": False, "reason": "replay_mismatch"}
+    oracle_generator = copy.deepcopy(planner_generator)
+    oracle = execute_action_sequence(oracle_generator, actions[start:goal])
+    oracle_error = standardized_xmeas_mse(
+        oracle["observations"][-1], observations[goal], stats
+    )
+    if not oracle["alive"] or oracle_error > replay_threshold:
+        return {"valid": False, "reason": "oracle_unreachable"}
+    hold_generator = copy.deepcopy(planner_generator)
+    hold = np.broadcast_to(actions[max(start - 1, 0)], (goal - start, actions.shape[1]))
+    no_action = execute_action_sequence(hold_generator, hold)
+    no_action_error = standardized_xmeas_mse(
+        no_action["observations"][-1], observations[goal], stats
+    )
+    if (
+        require_nontrivial and no_action["alive"]
+        and no_action_error <= success_threshold
+    ):
+        return {"valid": False, "reason": "trivial_goal"}
+    return {
+        "valid": True, "reason": "accepted",
+        "generator": planner_generator, "replay_mse": replay_error,
+        "oracle_mse": oracle_error, "no_action_mse": no_action_error,
+        "no_action_alive": no_action["alive"],
     }

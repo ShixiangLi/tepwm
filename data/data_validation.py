@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+from collections import Counter, defaultdict
+from pathlib import Path
 from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
@@ -144,6 +148,107 @@ def summarize_action_coverage(
         "covered_sp_numbers": covered,
         "missing_sp_numbers": missing,
         "coverage_ratio": len(covered) / len(expected),
+    }
+
+
+def audit_dataset(
+    dataset_dir: str | Path,
+    expected_sp_numbers: Sequence[int] = DEFAULT_ACTION_SP_NUMBERS,
+) -> dict[str, Any]:
+    """Audit manifest integrity, split coverage and paired counterfactual groups."""
+    root = Path(dataset_dir)
+    manifest = root / "manifest.jsonl"
+    if not manifest.is_file():
+        raise FileNotFoundError(f"missing dataset manifest: {manifest}")
+    payload = manifest.read_bytes()
+    records = [
+        json.loads(line) for line in payload.decode("utf-8").splitlines()
+        if line.strip()
+    ]
+    identifiers = [str(record["trajectory_id"]) for record in records]
+    duplicate_ids = sorted(
+        key for key, count in Counter(identifiers).items() if count > 1
+    )
+    missing_files = sorted(
+        record["file"] for record in records
+        if not (root / record["file"]).is_file()
+    )
+    expected = tuple(map(int, expected_sp_numbers))
+    splits = sorted({str(record["split"]) for record in records})
+    action_counts = {
+        split: Counter({number: 0 for number in expected}) for split in splits
+    }
+    single_action_counts = {
+        split: Counter({number: 0 for number in expected}) for split in splits
+    }
+    counterfactual_groups = defaultdict(list)
+    for record in records:
+        split = str(record["split"])
+        changed = set(map(int, record.get("changed_action_sp_numbers", ())))
+        action_counts[split].update(changed)
+        if record["scenario_type"] == "single_action":
+            single_action_counts[split].update(changed)
+        if record.get("counterfactual_role"):
+            counterfactual_groups[str(record["group_id"])].append(record)
+    pair_errors = []
+    for group_id, pair in counterfactual_groups.items():
+        roles = {record["counterfactual_role"] for record in pair}
+        pair_splits = {record["split"] for record in pair}
+        if roles != {"reference", "intervention"} or len(pair_splits) != 1:
+            pair_errors.append(group_id)
+    missing_actions = {
+        split: [number for number, count in counts.items() if count == 0]
+        for split, counts in action_counts.items()
+    }
+    summary_path = root / "summary.json"
+    summary = json.loads(summary_path.read_text()) if summary_path.is_file() else {}
+    manifest_hash = hashlib.sha256(payload).hexdigest()
+    fingerprint_matches = summary.get("manifest_sha256") in (None, manifest_hash)
+    scenarios = sorted({str(record["scenario_type"]) for record in records})
+    scenario_counts_by_split = {
+        split: dict(Counter(
+            record["scenario_type"] for record in records
+            if record["split"] == split
+        )) for split in splits
+    }
+    missing_scenarios = {
+        split: sorted(set(scenarios) - set(counts))
+        for split, counts in scenario_counts_by_split.items()
+    }
+    mode_switch_targets = Counter(
+        str(event["mode"]) for record in records
+        for event in record.get("mode_event_schedule", ())
+    )
+    initialization_attempts = Counter(
+        int(record.get("initialization_attempts", 1)) for record in records
+    )
+    return {
+        "accepted": not duplicate_ids and not missing_files
+                    and not pair_errors and fingerprint_matches
+                    and not any(missing_actions.values())
+                    and not any(missing_scenarios.values()),
+        "trajectory_count": len(records),
+        "scenario_counts": dict(Counter(r["scenario_type"] for r in records)),
+        "outcome_counts": dict(Counter(r["outcome"] for r in records)),
+        "split_counts": dict(Counter(r["split"] for r in records)),
+        "mode_counts": dict(Counter(str(r["mode"]) for r in records)),
+        "scenario_counts_by_split": scenario_counts_by_split,
+        "missing_scenarios_by_split": missing_scenarios,
+        "outcome_counts_by_scenario": {
+            scenario: dict(Counter(
+                r["outcome"] for r in records if r["scenario_type"] == scenario
+            )) for scenario in scenarios},
+        "mode_switch_target_counts": dict(mode_switch_targets),
+        "initialization_attempt_counts": dict(initialization_attempts),
+        "action_counts_by_split": {k: dict(v) for k, v in action_counts.items()},
+        "single_action_counts_by_split": {
+            k: dict(v) for k, v in single_action_counts.items()},
+        "missing_actions_by_split": missing_actions,
+        "duplicate_trajectory_ids": duplicate_ids,
+        "missing_files": missing_files,
+        "counterfactual_pair_errors": sorted(pair_errors),
+        "manifest_sha256": manifest_hash,
+        "fingerprint_matches": fingerprint_matches,
     }
 
 

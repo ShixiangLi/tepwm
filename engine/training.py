@@ -33,6 +33,12 @@ def train_world_model(
     training = dict(config["training"])
     model_config = dict(config["model"])
     dataset_path = Path(dataset_dir or training["dataset_dir"])
+    summary_path = dataset_path / "summary.json"
+    dataset_summary = (
+        json.loads(summary_path.read_text(encoding="utf-8"))
+        if summary_path.is_file()
+        else {}
+    )
     epochs = int(max_epochs or training.get("epochs", 100))
     device_obj, rank, world_size, distributed, initialized_here = _setup_distributed(
         device or training.get("device", "auto")
@@ -104,13 +110,17 @@ def train_world_model(
         lr=float(training.get("learning_rate", 5e-5)),
         weight_decay=float(training.get("weight_decay", 1e-3)),
     )
-    total_steps = max(1, epochs * len(train_loader))
-    warmup_steps = int(training.get("warmup_epochs", 5)) * len(train_loader)
+    accumulation_steps = int(training.get("gradient_accumulation_steps", 1))
+    if accumulation_steps < 1:
+        raise ValueError("gradient_accumulation_steps must be positive")
+    optimizer_steps = math.ceil(len(train_loader) / accumulation_steps)
+    total_steps = max(1, epochs * optimizer_steps)
+    warmup_steps = int(training.get("warmup_epochs", 5)) * optimizer_steps
     scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimizer, lambda step: _lr_multiplier(step, warmup_steps, total_steps)
     )
 
-    output_dir = Path(training.get("output_dir", "checkpoints/tep_lewm_v1"))
+    output_dir = Path(training.get("output_dir", "checkpoints/tep_lewm"))
     if is_main:
         output_dir.mkdir(parents=True, exist_ok=True)
     if distributed:
@@ -119,12 +129,21 @@ def train_world_model(
         **training,
         "world_size": world_size,
         "per_device_batch_size": per_device_batch,
-        "global_batch_size": per_device_batch * world_size,
+        "gradient_accumulation_steps": accumulation_steps,
+        "global_batch_size": per_device_batch * world_size * accumulation_steps,
+        "dataset_manifest_sha256": dataset_summary.get("manifest_sha256"),
+        "dataset_config_sha256": dataset_summary.get("config_sha256"),
+        "dataset_trajectory_count": dataset_summary.get("trajectory_count"),
+        "dataset_total_transitions": dataset_summary.get("total_transitions"),
     }
-    history, best_validation = [], float("inf")
+    history, best_validation, stale_epochs = [], float("inf"), 0
     checkpoint_metric = str(training.get("checkpoint_metric", "rollout_loss"))
     if checkpoint_metric not in {"prediction_loss", "rollout_loss"}:
         raise ValueError("checkpoint_metric must be prediction_loss or rollout_loss")
+    patience = int(training.get("early_stopping_patience", 0))
+    minimum_delta = float(training.get("early_stopping_min_delta", 0.0))
+    if patience < 0 or minimum_delta < 0:
+        raise ValueError("early stopping patience and minimum delta must be non-negative")
     checkpoint_training.update({
         "rollout_horizons": list(rollout_horizons),
         "checkpoint_metric": checkpoint_metric,
@@ -136,6 +155,7 @@ def train_world_model(
             model, criterion, train_loader, device_obj,
             optimizer=optimizer, scheduler=scheduler,
             gradient_clip=float(training.get("gradient_clip", 1.0)),
+            gradient_accumulation_steps=accumulation_steps,
             rollout_horizons=rollout_horizons,
             description=f"Epoch {epoch}/{epochs} train",
             show_progress=is_main,
@@ -152,18 +172,26 @@ def train_world_model(
             **{f"validation_{key}": value for key, value in validation_metrics.items()},
         }
         history.append(epoch_metrics)
+        current_validation = validation_metrics[checkpoint_metric]
+        improved = current_validation < best_validation - minimum_delta
+        stale_epochs = 0 if improved else stale_epochs + 1
+        if improved:
+            best_validation = current_validation
         if is_main:
             checkpoint = _checkpoint(
                 _unwrap_model(model), optimizer, epoch, model_config,
                 checkpoint_training, stats.to_dict(), history,
             )
             torch.save(checkpoint, output_dir / "last.pt")
-            if validation_metrics[checkpoint_metric] < best_validation:
-                best_validation = validation_metrics[checkpoint_metric]
+            if improved:
                 torch.save(checkpoint, output_dir / "best.pt")
             (output_dir / "history.json").write_text(
                 json.dumps(history, indent=2) + "\n", encoding="utf-8"
             )
+        if patience and stale_epochs >= patience:
+            if is_main:
+                print(f"Early stopping after {stale_epochs} epochs without improvement")
+            break
     result = {
         "model": _unwrap_model(model),
         "normalization": stats,
@@ -176,7 +204,8 @@ def train_world_model(
         "rank": rank,
         "world_size": world_size,
         "per_device_batch_size": per_device_batch,
-        "global_batch_size": per_device_batch * world_size,
+        "gradient_accumulation_steps": accumulation_steps,
+        "global_batch_size": per_device_batch * world_size * accumulation_steps,
         "checkpoint_metric": checkpoint_metric,
         "best_validation_metric": best_validation,
     }
@@ -206,6 +235,7 @@ def _run_epoch(
     optimizer: torch.optim.Optimizer | None = None,
     scheduler: torch.optim.lr_scheduler.LRScheduler | None = None,
     gradient_clip: float = 1.0,
+    gradient_accumulation_steps: int = 1,
     rollout_horizons: tuple[int, ...] = (1,),
     description: str = "",
     show_progress: bool = True,
@@ -231,7 +261,7 @@ def _run_epoch(
             if is_training else rollout_horizons
         )
         batch_size = len(observations)
-        if is_training:
+        if is_training and batch_index % gradient_accumulation_steps == 0:
             optimizer.zero_grad(set_to_none=True)
         with torch.set_grad_enabled(is_training):
             with torch.autocast(
@@ -245,11 +275,14 @@ def _run_epoch(
                 )
                 losses = criterion(output)
             if is_training:
-                losses["loss"].backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip)
-                optimizer.step()
-                if scheduler is not None:
-                    scheduler.step()
+                group_start = batch_index // gradient_accumulation_steps * gradient_accumulation_steps
+                group_size = min(gradient_accumulation_steps, len(loader) - group_start)
+                (losses["loss"] / group_size).backward()
+                if batch_index + 1 == group_start + group_size:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip)
+                    optimizer.step()
+                    if scheduler is not None:
+                        scheduler.step()
         for name in totals:
             totals[name] += float(losses[name].detach()) * batch_size
         sample_count += batch_size

@@ -160,6 +160,10 @@ class TEPDataGenerator:
             dtype=np.float64,
         )
 
+    def get_observation(self) -> np.ndarray:
+        """Return the current 53-dimensional observable process state."""
+        return self._observation().copy()
+
     def set_action(self, action: Sequence[float]) -> np.ndarray:
         """一次设置完整SP动作向量，并校验维度与数值有效性。"""
         values = np.asarray(action, dtype=np.float64).reshape(-1)

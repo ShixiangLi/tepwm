@@ -15,12 +15,7 @@ data:
 
   # 训练数据运行边界；为空时只记录TEP自身的停车结果。
   # 示例：{XMEAS7: [2500.0, 2900.0], XMEAS9: [110.0, 130.0]}
-  safety_limits:
-    XMEAS7: [2500.0, 2900.0]
-    XMEAS8: [20.0, 80.0]
-    XMEAS9: [110.0, 130.0]
-    XMEAS12: [20.0, 80.0]
-    XMEAS15: [20.0, 80.0]
+  safety_limits: {}
   boundary_margin_fraction: 0.05
 
   # 示例：
@@ -38,45 +33,50 @@ data:
     seed: 2026
     dataset_name: tep_latest
     overwrite: true  # 每次完整生成替换固定的latest目录。
-    num_trajectories: 300
-    counterfactual_pairs: 30
-    num_workers: 8  # 按轨迹并行；内存或磁盘压力较大时可调低。
+    num_trajectories: 1400
+    counterfactual_pairs: 60
+    num_workers: 32  # 按轨迹并行；内存或磁盘压力较大时可调低。
     compress: false  # 关闭压缩可加快保存，但会增加磁盘占用。
     # 当前仿真器只有一套基准稳态内部状态；3/6仅用于切换或越界轨迹，
     # 不作为需要长时间预热的初始稳态工况。
     operating_modes: [1, 2, 4, 5]
     warmup_minutes: [120, 240]
+    warmup_retries: 5
 
     # 基础场景占比；反事实轨迹对在此基础上额外生成。
     scenario_proportions:
-      fixed_sp: 0.15
-      single_action: 0.20
-      multi_action: 0.40
-      disturbance: 0.25
+      fixed_sp: 0.08
+      single_action: 0.35
+      multi_action: 0.25
+      disturbance: 0.12
+      boundary_action: 0.10
+      mode_switch: 0.10
 
     duration_minutes:
       fixed_sp: [60, 180]
       single_action: [180, 300]
       multi_action: [240, 480]
       disturbance: [240, 480]
+      boundary_action: [240, 480]
+      mode_switch: [180, 360]
 
     split_ratios:
-      train: 0.80
-      validation: 0.10
-      test: 0.10
+      train: 0.70
+      validation: 0.15
+      test: 0.15
 
     action:
-      first_event_minutes: [20, 40]
-      hold_minutes: [20, 60]
+      first_event_minutes: [30, 60]
+      hold_minutes: [45, 90]
       final_context_minutes: 30
       multi_event_count: [2, 6]
       sp_per_event: [1, 3]
-      restore_probability: 0.20
+      restore_probability: 0.10
       # 少量动作采到允许范围边缘，用于形成近边界和超限样本。
-      boundary_probability: 0.10
+      boundary_probability: 0.02
       boundary_band_fraction: 0.05
       # 相对于每个SP允许范围的阶跃比例。
-      step_fraction: [0.10, 0.35]
+      step_fraction: [0.10, 0.30]
       bounds:
         SP5: [24.0, 30.0]
         SP7: [35.0, 65.0]
@@ -89,6 +89,11 @@ data:
         SP18: [118.0, 130.0]
         SP19: [11.0, 16.0]
         SP20: [0.75, 0.90]
+
+    mode_switch:
+      target_modes: [1, 2, 3, 4, 5, 6]
+      event_minutes: [30, 90]
+      final_context_minutes: 60
 
     disturbance:
       idvs: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
@@ -124,10 +129,14 @@ training:
   rollout_weight: 1.0
   checkpoint_metric: rollout_loss
   preload: true
-  # 单卡批量大小；DDP全局批量大小 = batch_size × GPU数量。
+  # 单卡批量大小；有效全局批量 = batch_size × GPU数量 × 梯度累积步数。
+  # 8卡H100使用256 × 8 × 1 = 2048；显卡较少时可增大累积步数保持等效批量。
   batch_size: 256
+  gradient_accumulation_steps: 1
   loader_workers: 0
   epochs: 100
+  early_stopping_patience: 0  # 正式训练默认关闭；快速消融时可显式启用。
+  early_stopping_min_delta: 0.0001
   warmup_epochs: 5
   learning_rate: 0.00005
   weight_decay: 0.001
@@ -137,10 +146,12 @@ training:
   sigreg_projections: 1024
   seed: 3072
   device: auto
-  output_dir: checkpoints/tep_lewm_multistep_v2
+  output_dir: checkpoints/tep_lewm
 
 evaluation:
-  split: test
+  validation_split: validation
+  test_split: test
+  split: validation
   scenario_types: [single_action, multi_action]
   horizons: [1, 5, 10, 30]
   batch_size: 256
@@ -159,11 +170,16 @@ planning:
   action_change_weight: 0.05
   seed: 42
   # 测试集任务：从首个动作时刻出发，以30分钟后的真实状态作为可达目标。
-  split: test
+  validation_split: validation
+  test_split: test
+  split: validation
   scenario_types: [single_action, multi_action]
-  num_tasks: null  # null表示评估全部满足条件的测试任务。
+  num_tasks: 80
   goal_offset_minutes: 30
   simulator_steps_per_control: 60
   replan_every: 5
+  allowed_outcomes: [normal, near_boundary, recovered]
+  replay_mse_threshold: 0.0001
+  require_nontrivial_goal: true
   # 未停机且最终标准化XMEAS MSE不超过该绝对阈值，记为成功。
   success_mse_threshold: 0.10
