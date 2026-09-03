@@ -157,6 +157,8 @@ evaluation:
   batch_size: 256
 
 planning:
+  # 规划任务彼此独立；8卡服务器上每张GPU运行一个评估进程。
+  num_workers: 8
   horizon: 30
   num_samples: 512
   num_elites: 64
@@ -164,9 +166,11 @@ planning:
   momentum: 0.10
   min_std_fraction: 0.01
   initial_std_fraction: 0.15
-  action_block_size: 10
+  # 当前30分钟目标任务均为一次SP调整后保持；单块参数化可显著降低CEM搜索维度。
+  action_block_size: 30
   max_changed_actions: 3
-  max_action_delta_fraction: 0.20
+  # 与训练数据常规动作的最大阶跃比例保持一致。
+  max_action_delta_fraction: 0.30
   action_change_weight: 0.05
   seed: 42
   # 测试集任务：从首个动作时刻出发，以30分钟后的真实状态作为可达目标。

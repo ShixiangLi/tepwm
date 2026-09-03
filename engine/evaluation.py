@@ -1,6 +1,5 @@
 """Latent one-step and autoregressive rollout evaluation for TEP-LeWM."""
 from __future__ import annotations
-from collections import Counter
 from collections.abc import Sequence
 from pathlib import Path
 import numpy as np
@@ -8,10 +7,7 @@ import pandas as pd
 import torch
 from tqdm.auto import tqdm
 from data.data_process import NormalizationStats, load_manifest
-from engine.planning import (
-    build_cem_planner, prepare_tep_planning_task, run_tep_mpc,
-    standardized_xmeas_mse,
-)
+from engine.planning_evaluation import evaluate_planning_tasks
 from engine.training import load_checkpoint
 def predict_latent_trajectory(
     checkpoint_path: str | Path,
@@ -177,169 +173,6 @@ def evaluate_latent_prediction(
         "checkpoint_epoch": int(checkpoint["epoch"]),
         "device": str(device_obj),
     }
-def evaluate_planning_tasks(
-    checkpoint_path: str | Path,
-    dataset_dir: str | Path,
-    config: dict,
-    *,
-    split: str | None = None,
-    device: str = "auto",
-    show_progress: bool = True,
-    planner_overrides: dict | None = None,
-) -> dict:
-    """Run CEM-MPC on held-out reachable goals and report XMEAS success."""
-    settings = config.get("planning", {})
-    split = split or settings.get("split", "validation")
-    scenarios = set(settings.get(
-        "scenario_types", config.get("evaluation", {}).get(
-            "scenario_types", ["single_action", "multi_action"]
-        ),
-    ))
-    task_count = settings.get("num_tasks")
-    task_count = None if task_count is None else int(task_count)
-    goal_minutes = int(settings.get("goal_offset_minutes", 30))
-    steps_per_control = int(settings.get("simulator_steps_per_control", 60))
-    replan_every = int(settings.get("replan_every", 1))
-    success_threshold = float(settings.get("success_mse_threshold", 0.10))
-    if (task_count is not None and task_count < 1) or goal_minutes < 1 or success_threshold <= 0:
-        raise ValueError("invalid planning evaluation settings")
-    allowed_outcomes = set(settings.get(
-        "allowed_outcomes", ["normal", "near_boundary", "recovered"]
-    ))
-    replay_threshold = float(settings.get("replay_mse_threshold", 1e-4))
-    require_nontrivial = bool(settings.get("require_nontrivial_goal", True))
-    root = Path(dataset_dir)
-    records = [
-        record for record in load_manifest(root, split)
-        if record["scenario_type"] in scenarios
-        and record.get("action_event_schedule")
-        and not record.get("active_idvs", [])
-    ]
-    rng = np.random.default_rng(int(settings.get("seed", 42)))
-    rng.shuffle(records)
-    candidate_count = sum(len({round(float(e["time_hours"]) * 3600)
-        for e in r["action_event_schedule"]}) for r in records)
-    rejections = Counter()
-    if not records:
-        raise ValueError("no valid held-out action trajectory is available")
-    planner = build_cem_planner(
-        checkpoint_path, config, device=device, **(planner_overrides or {}))
-    rows, cases = [], []
-    history_size = int(planner.model.history_size)
-    sample_stride = int(config["training"].get("sample_stride_steps", 60))
-    control_steps = round(goal_minutes * 60 / steps_per_control)
-    for record in tqdm(records, desc="CEM-MPC planning evaluation",
-                       unit="trajectory", disable=not show_progress):
-        if task_count is not None and len(rows) >= task_count:
-            break
-        scheduled_starts = sorted({round(float(e["time_hours"]) * 3600)
-                                   for e in record["action_event_schedule"]})
-        if record.get("outcome") not in allowed_outcomes:
-            rejections["disallowed_outcome"] += len(scheduled_starts)
-            continue
-        with np.load(root / record["file"], allow_pickle=False) as data:
-            observations = np.asarray(data["observations"], dtype=np.float32)
-            actions = np.asarray(data["actions"], dtype=np.float32)
-        starts = [start for start in scheduled_starts if
-                  start - (history_size - 1) * sample_stride >= 0 and
-                  start + control_steps * steps_per_control < len(observations)]
-        rejections["insufficient_context"] += len(scheduled_starts) - len(starts)
-        for start in rng.permutation(starts):
-            if task_count is not None and len(rows) >= task_count:
-                break
-            start = int(start)
-            goal = start + control_steps * steps_per_control
-            history_indices = start - np.arange(
-                history_size - 1, -1, -1) * sample_stride
-            audit = prepare_tep_planning_task(
-                config["data"], record, observations, actions, start, goal,
-                planner.stats, success_threshold=success_threshold,
-                replay_threshold=replay_threshold,
-                require_nontrivial=require_nontrivial,
-            )
-            if not audit["valid"]:
-                rejections[audit["reason"]] += 1
-                continue
-            generator = audit.pop("generator")
-            result = run_tep_mpc(
-                generator, planner, observations[history_indices],
-                actions[history_indices[:-1]], observations[goal],
-                control_steps=control_steps,
-                simulator_steps_per_control=steps_per_control,
-                replan_every=replan_every,
-            )
-            reference_indices = (
-                start + np.arange(control_steps + 1) * steps_per_control)
-            reference_action_indices = reference_indices[:-1]
-            initial_error = standardized_xmeas_mse(
-                observations[start], observations[goal], planner.stats
-            )
-            final_error = standardized_xmeas_mse(
-                result["observations"][-1], observations[goal], planner.stats
-            )
-            improvement = 1.0 - final_error / max(initial_error, 1e-12)
-            success = bool(result["alive"] and final_error <= success_threshold)
-            row = {
-                "trajectory_id": record["trajectory_id"],
-                "task_id": f"{record['trajectory_id']}:{start}",
-                "split": split,
-                "mode": int(record["mode"]),
-                "start_step": start,
-                "replay_xmeas_mse": audit["replay_mse"],
-                "oracle_xmeas_mse": audit["oracle_mse"],
-                "no_action_xmeas_mse": audit["no_action_mse"],
-                "scenario_type": record["scenario_type"],
-                "initial_xmeas_mse": initial_error,
-                "final_xmeas_mse": final_error,
-                "improvement": improvement,
-                "success": success,
-                "alive": bool(result["alive"]),
-            }
-            rows.append(row)
-            cases.append({
-                **row,
-                "time_minutes": np.arange(control_steps + 1) * steps_per_control / 60,
-                "reference_observations": observations[reference_indices],
-                "planned_observations": result["observations"],
-                "reference_actions": actions[reference_action_indices],
-                "planned_actions": result["actions"],
-                "goal_observation": observations[goal],
-                "normalization": planner.stats,
-                "action_sp_numbers": tuple(config["data"]["action_sp_numbers"]),
-            })
-    if not rows:
-        raise ValueError("no trajectory is long enough for the configured planning task")
-    per_task = pd.DataFrame(rows)
-    summary = _planning_summary(per_task, success_threshold)
-    pool = [case for case in cases if case["success"]] or cases
-    typical = min(pool, key=lambda case: abs(
-        case["improvement"] - np.median([item["improvement"] for item in pool])
-    ))
-    return {
-        "summary": summary, "per_task": per_task,
-        "typical_case": typical, "cases": cases,
-        "split": split,
-        "screening": {"candidate_count": candidate_count,
-                      "screened_count": len(rows) + sum(rejections.values()),
-                      "accepted_count": len(rows),
-                      "rejections": dict(rejections)},
-    }
-def _planning_summary(per_task: pd.DataFrame, threshold: float) -> pd.DataFrame:
-    """Aggregate overall and scenario-specific planning success metrics."""
-    groups = [("overall", per_task), *per_task.groupby("scenario_type")]
-    return pd.DataFrame([{
-        "scenario_type": name,
-        "task_count": len(group),
-        "trajectory_count": group["trajectory_id"].nunique(),
-        "success_rate": group["success"].mean(),
-        "shutdown_rate": 1.0 - group["alive"].mean(),
-        "initial_xmeas_mse": group["initial_xmeas_mse"].mean(),
-        "final_xmeas_mse": group["final_xmeas_mse"].mean(),
-        "oracle_xmeas_mse": group["oracle_xmeas_mse"].mean(),
-        "no_action_xmeas_mse": group["no_action_xmeas_mse"].mean(),
-        "mean_improvement": group["improvement"].mean(),
-        "success_mse_threshold": threshold,
-    } for name, group in groups])
 def _collect_windows(
     dataset_dir, split, scenario_types, history_size, horizon,
     sample_stride, window_stride,
