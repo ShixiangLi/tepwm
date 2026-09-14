@@ -18,6 +18,7 @@ from torch.utils.data.distributed import DistributedSampler
 from tqdm.auto import tqdm
 
 from data.data_process import NormalizationStats, TEPWindowDataset, compute_normalization
+from data.data_validation import model_step_seconds
 from models.losses import LeWMLoss
 from models.model import build_tep_lewm
 
@@ -39,6 +40,9 @@ def train_world_model(
         if summary_path.is_file()
         else {}
     )
+    stride = model_step_seconds(config["data"])
+    if dataset_summary.get("model_step_seconds") != stride:
+        raise ValueError("dataset model step does not match config; regenerate the dataset")
     epochs = int(max_epochs or training.get("epochs", 100))
     device_obj, rank, world_size, distributed, initialized_here = _setup_distributed(
         device or training.get("device", "auto")
@@ -46,15 +50,9 @@ def train_world_model(
     is_main = rank == 0
     seed = int(training.get("seed", 42))
     _set_seed(seed + rank)
-    rollout_horizons = tuple(sorted(set(map(
-        int, training.get("rollout_horizons", [5, 10, 30])
-    ))))
-    if not rollout_horizons or rollout_horizons[0] < 1:
-        raise ValueError("training rollout horizons must be positive")
     if device_obj.type == "cuda":
         torch.set_float32_matmul_precision("high")
 
-    stride = int(training.get("sample_stride_steps", 60))
     stats = _distributed_normalization(
         dataset_path, str(training.get("train_split", "train")), stride,
         device_obj, rank, distributed,
@@ -62,9 +60,7 @@ def train_world_model(
     dataset_options = {
         "stats": stats,
         "history_size": int(model_config["history_size"]),
-        "rollout_horizon": max(rollout_horizons),
         "sample_stride_steps": stride,
-        "window_stride_steps": int(training.get("window_stride_steps", stride)),
         "preload": bool(training.get("preload", True)),
     }
     train_set = TEPWindowDataset(
@@ -101,7 +97,6 @@ def train_world_model(
         model = DistributedDataParallel(model, device_ids=device_ids)
     criterion = LeWMLoss(
         sigreg_weight=float(training.get("sigreg_weight", 0.09)),
-        rollout_weight=float(training.get("rollout_weight", 1.0)),
         knots=int(training.get("sigreg_knots", 17)),
         num_proj=int(training.get("sigreg_projections", 1024)),
     ).to(device_obj)
@@ -127,6 +122,7 @@ def train_world_model(
         dist.barrier()
     checkpoint_training = {
         **training,
+        "model_step_seconds": stride,
         "world_size": world_size,
         "per_device_batch_size": per_device_batch,
         "gradient_accumulation_steps": accumulation_steps,
@@ -137,17 +133,12 @@ def train_world_model(
         "dataset_total_transitions": dataset_summary.get("total_transitions"),
     }
     history, best_validation, stale_epochs = [], float("inf"), 0
-    checkpoint_metric = str(training.get("checkpoint_metric", "rollout_loss"))
-    if checkpoint_metric not in {"prediction_loss", "rollout_loss"}:
-        raise ValueError("checkpoint_metric must be prediction_loss or rollout_loss")
+    checkpoint_metric = "prediction_loss"
     patience = int(training.get("early_stopping_patience", 0))
     minimum_delta = float(training.get("early_stopping_min_delta", 0.0))
     if patience < 0 or minimum_delta < 0:
         raise ValueError("early stopping patience and minimum delta must be non-negative")
-    checkpoint_training.update({
-        "rollout_horizons": list(rollout_horizons),
-        "checkpoint_metric": checkpoint_metric,
-    })
+    checkpoint_training["checkpoint_metric"] = checkpoint_metric
     for epoch in range(1, epochs + 1):
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
@@ -156,13 +147,11 @@ def train_world_model(
             optimizer=optimizer, scheduler=scheduler,
             gradient_clip=float(training.get("gradient_clip", 1.0)),
             gradient_accumulation_steps=accumulation_steps,
-            rollout_horizons=rollout_horizons,
             description=f"Epoch {epoch}/{epochs} train",
             show_progress=is_main,
         )
         validation_metrics = _run_epoch(
             model, criterion, val_loader, device_obj,
-            rollout_horizons=rollout_horizons,
             description=f"Epoch {epoch}/{epochs} validation",
             show_progress=is_main,
         )
@@ -236,7 +225,6 @@ def _run_epoch(
     scheduler: torch.optim.lr_scheduler.LRScheduler | None = None,
     gradient_clip: float = 1.0,
     gradient_accumulation_steps: int = 1,
-    rollout_horizons: tuple[int, ...] = (1,),
     description: str = "",
     show_progress: bool = True,
 ) -> dict[str, float]:
@@ -245,7 +233,7 @@ def _run_epoch(
     model.train(is_training)
     totals = {
         "loss": 0.0, "prediction_loss": 0.0,
-        "rollout_loss": 0.0, "sigreg_loss": 0.0,
+        "sigreg_loss": 0.0,
     }
     sample_count = 0
     progress = tqdm(
@@ -254,12 +242,6 @@ def _run_epoch(
     for batch_index, batch in enumerate(progress):
         observations = batch["observations"].to(device, non_blocking=True)
         actions = batch["actions"].to(device, non_blocking=True)
-        future_actions = batch["future_actions"].to(device, non_blocking=True)
-        rollout_targets = batch["rollout_targets"].to(device, non_blocking=True)
-        active_horizons = (
-            (rollout_horizons[batch_index % len(rollout_horizons)],)
-            if is_training else rollout_horizons
-        )
         batch_size = len(observations)
         if is_training and batch_index % gradient_accumulation_steps == 0:
             optimizer.zero_grad(set_to_none=True)
@@ -269,10 +251,7 @@ def _run_epoch(
                 dtype=torch.bfloat16,
                 enabled=device.type == "cuda" and torch.cuda.is_bf16_supported(),
             ):
-                output = model(
-                    observations, actions, future_actions,
-                    rollout_targets, active_horizons,
-                )
+                output = model(observations, actions)
                 losses = criterion(output)
             if is_training:
                 group_start = batch_index // gradient_accumulation_steps * gradient_accumulation_steps

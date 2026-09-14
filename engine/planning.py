@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from data.data_gen import TEPDataGenerator
-from data.data_validation import classify_trajectory_outcome
+from data.data_validation import classify_trajectory_outcome, model_step_seconds
 from data.data_process import NormalizationStats
 from engine.training import load_checkpoint
 class CEMPlanner:
@@ -17,16 +17,15 @@ class CEMPlanner:
         normalization: NormalizationStats,
         action_bounds: Sequence[Sequence[float]],
         *,
-        horizon: int = 10,
+        horizon: int = 6,
         num_samples: int = 512,
         num_elites: int = 64,
         iterations: int = 5,
         momentum: float = 0.1,
         min_std_fraction: float = 0.01,
         initial_std_fraction: float = 0.15,
-        action_block_size: int = 10,
         max_changed_actions: int = 3,
-        max_action_delta_fraction: float = 0.20,
+        max_action_delta_fraction: float = 0.30,
         action_change_weight: float = 0.05,
         seed: int = 42,
     ):
@@ -35,8 +34,8 @@ class CEMPlanner:
             raise ValueError("invalid CEM horizon, sample count or elite count")
         if iterations < 1 or not 0 <= momentum < 1 or min_std_fraction <= 0:
             raise ValueError("invalid CEM iteration or smoothing parameters")
-        if not 0 < initial_std_fraction <= 1 or action_block_size < 1:
-            raise ValueError("invalid CEM sampling or action-block settings")
+        if not 0 < initial_std_fraction <= 1:
+            raise ValueError("invalid CEM sampling settings")
         if not 1 <= max_changed_actions <= model.action_dim:
             raise ValueError("max_changed_actions is outside the action dimension")
         if max_action_delta_fraction <= 0 or action_change_weight < 0:
@@ -61,7 +60,6 @@ class CEMPlanner:
         self.momentum = float(momentum)
         self.min_std_fraction = float(min_std_fraction)
         self.initial_std_fraction = float(initial_std_fraction)
-        self.action_block_size = int(action_block_size)
         self.max_changed_actions = int(max_changed_actions)
         self.max_action_delta_fraction = float(max_action_delta_fraction)
         self.action_change_weight = float(action_change_weight)
@@ -91,6 +89,8 @@ class CEMPlanner:
             current = 0.5 * (self.physical_lower + self.physical_upper)
         if current.shape != (self.model.action_dim,):
             raise ValueError("initial_action has the wrong dimension")
+        if np.any(current < self.physical_lower - 1e-6) or np.any(current > self.physical_upper + 1e-6):
+            raise ValueError("current SP action is outside the shared action bounds")
         planning_horizon = self.horizon if horizon is None else int(horizon)
         if planning_horizon < 1 or planning_horizon > self.horizon:
             raise ValueError("horizon must be between 1 and the configured horizon")
@@ -111,6 +111,7 @@ class CEMPlanner:
                 generator=self.generator, device=self.device,
             )
             candidates = mean[None] + std[None] * noise
+            candidates[0] = current_tensor  # Keep a true hold option in every search.
             candidates = torch.maximum(
                 torch.minimum(candidates, self.upper), self.lower
             )
@@ -121,8 +122,11 @@ class CEMPlanner:
                 observations, past_actions, candidates[None]
             )
             costs = self.model.goal_cost(predicted, goal_tensor)[0]
-            action_change = (candidates[:, 0] - current_tensor) / action_range
-            costs = costs + self.action_change_weight * action_change.square().mean(-1)
+            preceding = torch.cat([
+                current_tensor.expand(self.num_samples, 1, -1), candidates[:, :-1]
+            ], dim=1)
+            action_change = (candidates - preceding) / action_range
+            costs = costs + self.action_change_weight * action_change.square().mean(-1).sum(-1)
             elite_indices = torch.topk(
                 costs, self.num_elites, largest=False
             ).indices
@@ -153,20 +157,19 @@ class CEMPlanner:
         self, candidates: torch.Tensor, current: torch.Tensor,
         action_range: torch.Tensor,
     ) -> torch.Tensor:
-        """Project CEM samples onto sparse, held and locally bounded SP changes."""
+        """Enforce sparsity and step size relative to each preceding action."""
         limit = self.max_action_delta_fraction * action_range
-        candidates = torch.maximum(
-            torch.minimum(candidates, current + limit), current - limit
-        )
-        for start in range(0, candidates.size(1), self.action_block_size):
-            stop = min(start + self.action_block_size, candidates.size(1))
-            candidates[:, start:stop] = candidates[:, start:start + 1]
-        delta = candidates - current
-        scores = delta.abs().amax(dim=1)
-        changed = scores.topk(self.max_changed_actions, dim=-1).indices
-        mask = torch.zeros_like(scores).scatter_(1, changed, 1.0)
-        candidates = current + delta * mask[:, None]
-        return torch.maximum(torch.minimum(candidates, self.upper), self.lower)
+        previous = current.expand(candidates.size(0), -1)
+        constrained = []
+        for step in range(candidates.size(1)):
+            proposal = torch.maximum(torch.minimum(candidates[:, step], self.upper), self.lower)
+            delta = torch.maximum(torch.minimum(proposal - previous, limit), -limit)
+            scores = delta.abs() / action_range
+            selected = scores.topk(self.max_changed_actions, dim=-1).indices
+            mask = torch.zeros_like(scores).scatter_(1, selected, 1.0)
+            previous = previous + delta * mask
+            constrained.append(previous)
+        return torch.stack(constrained, dim=1)
     def _prepare_context(self, observations, actions) -> tuple[np.ndarray, np.ndarray]:
         """Validate and truncate a causally aligned raw state/action history."""
         observations = np.asarray(observations, dtype=np.float32)
@@ -199,19 +202,25 @@ def build_cem_planner(
     device = "cpu" if device == "auto" else device
     model, checkpoint = load_checkpoint(checkpoint_path, device)
     stats = NormalizationStats.from_dict(checkpoint["normalization"])
+    if model_step_seconds(config["data"]) != int(
+        checkpoint["training_config"]["model_step_seconds"]
+    ):
+        raise ValueError("configured model step differs from checkpoint; retrain the model")
     data = config["data"]
     bounds_config = data["generation"]["action"]["bounds"]
     bounds = [bounds_config[f"SP{number}"] for number in data["action_sp_numbers"]]
     planner_keys = {
         "horizon", "num_samples", "num_elites", "iterations", "momentum",
-        "min_std_fraction", "initial_std_fraction", "action_block_size",
-        "max_changed_actions", "max_action_delta_fraction",
+        "min_std_fraction", "initial_std_fraction",
         "action_change_weight", "seed",
     }
     options = {
         key: value for key, value in config.get("planning", {}).items()
         if key in planner_keys
     }
+    action_config = data["generation"]["action"]
+    options["max_changed_actions"] = int(action_config["sp_per_event"][1])
+    options["max_action_delta_fraction"] = float(action_config["step_fraction"][1])
     options.update(overrides)
     return CEMPlanner(model, stats, bounds, **options)
 def run_tep_mpc(
@@ -222,7 +231,7 @@ def run_tep_mpc(
     goal_observation,
     *,
     control_steps: int,
-    simulator_steps_per_control: int = 60,
+    simulator_steps_per_control: int,
     replan_every: int = 1,
 ) -> dict[str, np.ndarray | bool]:
     """Periodically replan with CEM and execute the resulting actions in TEP."""
@@ -233,23 +242,28 @@ def run_tep_mpc(
     )
     executed_observations = [observations[-1].copy()]
     executed_actions, latent_costs = [], []
+    raw_observations = [observations[-1].copy()]
+    elapsed_seconds = [0]
     alive = True
     completed_steps = 0
     while completed_steps < control_steps:
+        # H is a planner setting; only the remaining task duration caps rollout.
         horizon = min(planner.horizon, control_steps - completed_steps)
         result = planner.plan(
-            observations, actions, goal_observation, horizon=horizon
+            observations, actions, goal_observation,
+            initial_action=generator.get_action(), horizon=horizon
         )
         planned_actions = np.asarray(result["actions"])
         latent_costs.append(float(result["latent_cost"]))
         execution_steps = min(replan_every, horizon)
         for offset in range(execution_steps):
             action = planned_actions[offset]
-            transition = generator.step(action)
-            for _ in range(simulator_steps_per_control - 1):
+            for second in range(simulator_steps_per_control):
+                transition = generator.step(action if second == 0 else None)
+                raw_observations.append(np.asarray(transition["next_observation"]).copy())
                 if not transition["alive"]:
                     break
-                transition = generator.step()
+            elapsed_seconds.append(len(raw_observations) - 1)
             next_observation = np.asarray(transition["next_observation"]).copy()
             executed_actions.append(action.copy())
             executed_observations.append(next_observation)
@@ -264,10 +278,17 @@ def run_tep_mpc(
                 break
         if not alive:
             break
+    _, violations = classify_trajectory_outcome(
+        np.asarray(raw_observations), generator.config.get("safety_limits", {}),
+        shutdown=not alive, terminated_early=not alive,
+    )
     return {
         "observations": np.asarray(executed_observations),
         "actions": np.asarray(executed_actions),
         "latent_costs": np.asarray(latent_costs),
+        "time_minutes": np.asarray(elapsed_seconds) / 60,
+        "limit_violations": violations,
+        "soft_limit_violated": any(violations.values()),
         "alive": alive,
     }
 def replay_tep_generator(
@@ -360,20 +381,30 @@ def prepare_tep_planning_task(
     )
     if not oracle["alive"] or oracle_error > replay_threshold:
         return {"valid": False, "reason": "oracle_unreachable"}
+    _, oracle_violations = classify_trajectory_outcome(
+        oracle["observations"], data_config.get("safety_limits", {}),
+        shutdown=False, terminated_early=False,
+    )
+    if any(oracle_violations.values()):
+        return {"valid": False, "reason": "unsafe_reference"}
     hold_generator = copy.deepcopy(planner_generator)
     hold = np.broadcast_to(actions[max(start - 1, 0)], (goal - start, actions.shape[1]))
     no_action = execute_action_sequence(hold_generator, hold)
     no_action_error = standardized_xmeas_mse(
         no_action["observations"][-1], observations[goal], stats
     )
-    if (
-        require_nontrivial and no_action["alive"]
-        and no_action_error <= success_threshold
-    ):
+    _, hold_violations = classify_trajectory_outcome(
+        no_action["observations"], data_config.get("safety_limits", {}),
+        shutdown=not no_action["alive"], terminated_early=not no_action["alive"],
+    )
+    hold_safe = no_action["alive"] and not any(hold_violations.values())
+    if require_nontrivial and hold_safe and no_action_error <= success_threshold:
         return {"valid": False, "reason": "trivial_goal"}
     return {
         "valid": True, "reason": "accepted",
         "generator": planner_generator, "replay_mse": replay_error,
         "oracle_mse": oracle_error, "no_action_mse": no_action_error,
         "no_action_alive": no_action["alive"],
+        "no_action_soft_limit_violated": any(hold_violations.values()),
+        "no_action_success": bool(hold_safe and no_action_error <= success_threshold),
     }

@@ -76,7 +76,7 @@ def plot_latent_prediction_evaluation(
     figure, axes = plt.subplots(1, 2, figsize=figsize)
     sns.lineplot(
         data=summary,
-        x="horizon",
+        x="horizon_minutes",
         y="latent_mse_mean",
         hue="scenario_type",
         marker="o",
@@ -90,7 +90,7 @@ def plot_latent_prediction_evaluation(
     )
     sns.boxplot(
         data=per_window,
-        x="horizon",
+        x="horizon_minutes",
         y="latent_mse",
         hue="scenario_type",
         showfliers=False,
@@ -132,7 +132,7 @@ def plot_planning_case(
     reference_error = np.square(reference_z[:, :41] - goal_z[:41]).mean(axis=1)
     planned_error = np.square(planned_z[:, :41] - goal_z[:41]).mean(axis=1)
     reference_time = np.asarray(case["time_minutes"], dtype=float)
-    planned_time = reference_time[:len(planned)]
+    planned_time = np.asarray(case["planned_time_minutes"], dtype=float)
 
     figure, axes = plt.subplots(2, 2, figsize=figsize)
     sns.lineplot(x=reference_time, y=reference_error, ax=axes[0, 0],
@@ -172,10 +172,12 @@ def plot_planning_case(
     ):
         sns.heatmap(
             values.T, cmap="vlag", center=0, vmin=-limit, vmax=limit,
-            yticklabels=labels, xticklabels=5, cbar_kws={"label": "Action z-score"},
+            yticklabels=labels, xticklabels=False, cbar_kws={"label": "Action z-score"},
             ax=axis,
         )
-        axis.set(title=title, xlabel="Control step (min)", ylabel="")
+        ticks = np.unique(np.linspace(0, len(values) - 1, min(7, len(values)), dtype=int))
+        axis.set_xticks(ticks + 0.5, [f"{reference_time[i]:g}" for i in ticks])
+        axis.set(title=title, xlabel="Time after planning start (min)", ylabel="")
     for axis in axes[0]:
         axis.grid(True, alpha=0.25)
         sns.despine(ax=axis)

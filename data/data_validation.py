@@ -18,6 +18,48 @@ SAMPLE_INTERVAL_HOURS = 1.0 / 3600.0
 DEFAULT_ACTION_SP_NUMBERS = (5, 7, 8, 11, 13, 14, 15, 17, 18, 19, 20)
 
 
+def model_step_seconds(data_config: Mapping[str, Any]) -> int:
+    """Convert the configured model interval to an exact number of 1-second steps."""
+    seconds = float(data_config["model_step_minutes"]) * 60
+    if (
+        not np.isfinite(seconds) or seconds < 1
+        or not np.isclose(seconds, round(seconds), rtol=0, atol=1e-8)
+    ):
+        raise ValueError("model_step_minutes must be positive and aligned to whole seconds")
+    return round(seconds)
+
+
+def validate_action_sampling(actions: np.ndarray, stride: int) -> None:
+    """Require each complete model transition to have one held SP action."""
+    if stride < 1:
+        raise ValueError("model step must be positive")
+    complete = len(actions) // stride * stride
+    blocks = actions[:complete].reshape(-1, stride, actions.shape[-1])
+    if not np.all(blocks == blocks[:, :1]):
+        raise ValueError(
+            "SP actions change within a model step; regenerate trajectories "
+            "on the configured model time grid"
+        )
+
+
+def action_change_counts(actions: np.ndarray, previous: np.ndarray) -> np.ndarray:
+    """Count actual SP changes at each event, including previous -> first action."""
+    actions = np.asarray(actions)
+    preceding = np.concatenate([np.asarray(previous)[None], actions[:-1]], axis=0)
+    return (~np.isclose(actions, preceding, rtol=1e-6, atol=1e-6)).sum(axis=-1)
+
+
+def matches_action_window(counts: np.ndarray, scenario_type: str) -> bool:
+    """Require repeated events and the requested single/multiple-SP pattern."""
+    if np.count_nonzero(counts) < 2:
+        return False
+    if scenario_type == "single_action":
+        return bool(np.all(counts <= 1))
+    if scenario_type == "multi_action":
+        return bool(np.any(counts >= 2))
+    return True
+
+
 def validate_trajectory(
     trajectory: Trajectory,
     *,
@@ -182,8 +224,10 @@ def audit_dataset(
         split: Counter({number: 0 for number in expected}) for split in splits
     }
     counterfactual_groups = defaultdict(list)
+    group_splits = defaultdict(set)
     for record in records:
         split = str(record["split"])
+        group_splits[str(record["group_id"])].add(split)
         changed = set(map(int, record.get("changed_action_sp_numbers", ())))
         action_counts[split].update(changed)
         if record["scenario_type"] == "single_action":
@@ -191,6 +235,7 @@ def audit_dataset(
         if record.get("counterfactual_role"):
             counterfactual_groups[str(record["group_id"])].append(record)
     pair_errors = []
+    leaking_groups = sorted(group for group, values in group_splits.items() if len(values) > 1)
     for group_id, pair in counterfactual_groups.items():
         roles = {record["counterfactual_role"] for record in pair}
         pair_splits = {record["split"] for record in pair}
@@ -224,7 +269,7 @@ def audit_dataset(
     )
     return {
         "accepted": not duplicate_ids and not missing_files
-                    and not pair_errors and fingerprint_matches
+                    and not pair_errors and not leaking_groups and fingerprint_matches
                     and not any(missing_actions.values())
                     and not any(missing_scenarios.values()),
         "trajectory_count": len(records),
@@ -247,6 +292,7 @@ def audit_dataset(
         "duplicate_trajectory_ids": duplicate_ids,
         "missing_files": missing_files,
         "counterfactual_pair_errors": sorted(pair_errors),
+        "cross_split_groups": leaking_groups,
         "manifest_sha256": manifest_hash,
         "fingerprint_matches": fingerprint_matches,
     }

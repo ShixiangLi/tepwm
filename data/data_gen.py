@@ -16,6 +16,7 @@ from data.data_validation import (
     DEFAULT_ACTION_SP_NUMBERS,
     SAMPLE_INTERVAL_HOURS,
     classify_trajectory_outcome,
+    model_step_seconds,
 )
 
 # SP12 is implemented by controller 22 in the TEP decentralized controller.
@@ -245,14 +246,15 @@ class TEPDataGenerator:
         )
         start_time = float(self.simulator.time)
         initial_action = self.get_action().copy()
+        step_seconds = model_step_seconds(trajectory_config)
         mode_events = self._group_events(
-            trajectory_config.get("mode_events", []), duration, "mode"
+            trajectory_config.get("mode_events", []), duration, "mode", step_seconds
         )
         action_events = self._group_events(
-            trajectory_config.get("action_events", []), duration, "action"
+            trajectory_config.get("action_events", []), duration, "action", step_seconds
         )
         disturbance_events = self._group_events(
-            trajectory_config.get("disturbance_events", []), duration, "disturbance"
+            trajectory_config.get("disturbance_events", []), duration, "disturbance", step_seconds
         )
 
         time = [0.0]
@@ -324,6 +326,7 @@ class TEPDataGenerator:
                 "warmup_hours": float(trajectory_config.get("warmup_hours", 0.0)),
                 "requested_duration_hours": duration,
                 "action_sp_numbers": self.action_sp_numbers,
+                "initial_action": initial_action.tolist(),
                 "changed_action_sp_numbers": tuple(
                     number
                     for number, is_changed in zip(self.action_sp_numbers, changed)
@@ -355,6 +358,7 @@ class TEPDataGenerator:
         events: Sequence[Mapping[str, Any]],
         duration_hours: float,
         event_name: str,
+        step_seconds: int,
     ) -> dict[int, list[Mapping[str, Any]]]:
         """校验事件时间，并按一秒采样步索引对事件分组。"""
         grouped: dict[int, list[Mapping[str, Any]]] = defaultdict(list)
@@ -369,6 +373,8 @@ class TEPDataGenerator:
                 raise ValueError("event time must be non-negative and aligned to 1 second")
             if event_time >= duration_hours:
                 raise ValueError("event time must be earlier than trajectory duration")
+            if event_name in {"action", "mode"} and step_index % step_seconds:
+                raise ValueError("SP and mode events must align with model_step_minutes")
             grouped[step_index].append(event)
         return grouped
 

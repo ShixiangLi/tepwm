@@ -11,6 +11,7 @@ from typing import Any
 import numpy as np
 import torch
 from torch.utils.data import Dataset
+from data.data_validation import validate_action_sampling
 
 
 @dataclass(frozen=True)
@@ -52,6 +53,13 @@ def load_manifest(dataset_dir: str | Path, split: str | None = None) -> list[dic
     if not path.is_file():
         raise FileNotFoundError(f"dataset manifest not found: {path}")
     records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    assignments = {}
+    for record in records:
+        for key in ("trajectory_id", "group_id"):
+            identity = (key, record[key])
+            previous = assignments.setdefault(identity, record["split"])
+            if previous != record["split"]:
+                raise ValueError(f"{key}={record[key]} occurs in multiple splits")
     if split is not None:
         records = [record for record in records if record["split"] == split]
     if not records:
@@ -66,7 +74,7 @@ def compute_normalization(
     dataset_dir: str | Path,
     *,
     split: str = "train",
-    sample_stride_steps: int = 60,
+    sample_stride_steps: int,
     minimum_std: float = 1e-6,
 ) -> NormalizationStats:
     """Stream training trajectories once to estimate observation/action z-scores."""
@@ -108,7 +116,7 @@ def compute_normalization(
 
 
 class TEPWindowDataset(Dataset):
-    """Expose causal history windows with aligned future rollout supervision."""
+    """Expose causal windows of L actions and L+1 observations for one-step loss."""
 
     def __init__(
         self,
@@ -117,34 +125,28 @@ class TEPWindowDataset(Dataset):
         stats: NormalizationStats,
         *,
         history_size: int = 8,
-        rollout_horizon: int = 1,
-        sample_stride_steps: int = 60,
-        window_stride_steps: int = 60,
+        sample_stride_steps: int,
         preload: bool = False,
         cache_size: int = 4,
     ):
         """Index valid windows and optionally preload their normalized arrays."""
         if min(
-            history_size, rollout_horizon, sample_stride_steps,
-            window_stride_steps, cache_size,
+            history_size, sample_stride_steps, cache_size,
         ) < 1:
             raise ValueError("window and cache parameters must be positive")
         self.root = Path(dataset_dir)
         self.records = load_manifest(self.root, split)
         self.stats = stats
         self.history_size = history_size
-        self.rollout_horizon = rollout_horizon
         self.sample_stride_steps = sample_stride_steps
         self.cache_size = cache_size
         self.index: list[tuple[int, int]] = []
-        required_steps = (
-            history_size - 1 + rollout_horizon
-        ) * sample_stride_steps
+        required_steps = history_size * sample_stride_steps
         for file_index, record in enumerate(self.records):
             last_start = int(record["transitions"]) - required_steps
             self.index.extend(
                 (file_index, start)
-                for start in range(0, last_start + 1, window_stride_steps)
+                for start in range(0, last_start + 1, sample_stride_steps)
             )
         if not self.index:
             raise ValueError(f"no valid {split} windows for the requested history")
@@ -161,16 +163,14 @@ class TEPWindowDataset(Dataset):
     def __getitem__(self, item: int) -> dict[str, torch.Tensor]:
         """Return one normalized observation/action training window."""
         if self._preloaded is None:
-            observations, actions, future_actions, targets = self._window(item)
+            observations, actions = self._window(item)
         else:
-            observations, actions, future_actions, targets = (
+            observations, actions = (
                 array[item] for array in self._preloaded
             )
         return {
             "observations": torch.from_numpy(observations),
             "actions": torch.from_numpy(actions),
-            "future_actions": torch.from_numpy(future_actions),
-            "rollout_targets": torch.from_numpy(targets),
         }
 
     def describe(self) -> dict[str, Any]:
@@ -179,7 +179,6 @@ class TEPWindowDataset(Dataset):
             "trajectory_count": len(self.records),
             "window_count": len(self),
             "history_size": self.history_size,
-            "rollout_horizon": self.rollout_horizon,
             "sample_stride_seconds": self.sample_stride_steps,
         }
 
@@ -194,28 +193,20 @@ class TEPWindowDataset(Dataset):
                 np.asarray(data["observations"], dtype=np.float32),
                 np.asarray(data["actions"], dtype=np.float32),
             )
+        validate_action_sampling(arrays[1], self.sample_stride_steps)
         self._cache[file_index] = arrays
         if len(self._cache) > self.cache_size:
             self._cache.popitem(last=False)
         return arrays
 
     def _window(self, item: int) -> tuple[np.ndarray, ...]:
-        """Slice one teacher-forced window and its aligned future rollout."""
+        """Pair o[t], held a[t] and o[t+1] at the configured sampling interval."""
         file_index, start = self.index[item]
         observations, actions = self._read_trajectory(file_index)
         indices = start + np.arange(self.history_size + 1) * self.sample_stride_steps
-        future_indices = start + (
-            self.history_size - 1 + np.arange(self.rollout_horizon)
-        ) * self.sample_stride_steps
         obs = self.stats.normalize_observations(observations[indices])
         act = self.stats.normalize_actions(actions[indices[:-1]])
-        future = self.stats.normalize_actions(actions[future_indices])
-        targets = self.stats.normalize_observations(
-            observations[future_indices + self.sample_stride_steps]
-        )
-        return tuple(array.astype(np.float32) for array in (
-            obs, act, future, targets,
-        ))
+        return obs.astype(np.float32), act.astype(np.float32)
 
     def _preload_windows(self) -> tuple[np.ndarray, ...]:
         """Materialize normalized windows once for fast randomized GPU training."""
@@ -227,15 +218,6 @@ class TEPWindowDataset(Dataset):
             (len(self), self.history_size, len(self.stats.action_mean)),
             dtype=np.float32,
         )
-        future_actions = np.empty(
-            (len(self), self.rollout_horizon, len(self.stats.action_mean)),
-            dtype=np.float32,
-        )
-        targets = np.empty(
-            (len(self), self.rollout_horizon, len(self.stats.observation_mean)),
-            dtype=np.float32,
-        )
         for item in range(len(self)):
-            (observations[item], actions[item], future_actions[item],
-             targets[item]) = self._window(item)
-        return observations, actions, future_actions, targets
+            observations[item], actions[item] = self._window(item)
+        return observations, actions

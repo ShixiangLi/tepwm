@@ -30,10 +30,7 @@ def plot_training_history(
     if sigreg_weight < 0:
         raise ValueError("sigreg_weight must be non-negative")
 
-    selection_column = (
-        "validation_rollout_loss"
-        if "validation_rollout_loss" in frame else "validation_prediction_loss"
-    )
+    selection_column = "validation_prediction_loss"
     best = frame.loc[frame[selection_column].idxmin()]
     summary = {
         "best_epoch": int(best["epoch"]),
@@ -54,13 +51,10 @@ def plot_training_history(
     components = (
         ("train_prediction_loss", "Train prediction", "-"),
         ("validation_prediction_loss", "Validation prediction", "--"),
-        ("train_rollout_loss", "Train rollout", "-"),
-        ("validation_rollout_loss", "Validation rollout", "--"),
         ("train_sigreg_loss", "Train weighted SIGReg", "-"),
         ("validation_sigreg_loss", "Validation weighted SIGReg", "--"),
     )
-    components = tuple(item for item in components if item[0] in frame)
-    colors = {"prediction": "#0072B2", "rollout": "#D55E00", "sigreg": "#009E73"}
+    colors = {"prediction": "#0072B2", "sigreg": "#009E73"}
     for column, label, style in components:
         color = next(value for key, value in colors.items() if key in column)
         values = frame[column] * sigreg_weight if "sigreg" in column else frame[column]

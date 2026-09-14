@@ -295,13 +295,15 @@ def plot_counterfactual_comparison(
     """
     reference_time = np.asarray(reference.time, dtype=float)
     intervention_time = np.asarray(intervention.time, dtype=float)
-    if reference_time.shape != intervention_time.shape or not np.allclose(
-        reference_time, intervention_time
-    ):
+    common_length = min(len(reference_time), len(intervention_time))
+    truncated = len(reference_time) != len(intervention_time)
+    reference_time = reference_time[:common_length]
+    intervention_time = intervention_time[:common_length]
+    if not np.allclose(reference_time, intervention_time):
         raise ValueError("counterfactual trajectories must share the same time axis")
 
-    reference_observations = _to_2d_float_array(reference.observations)
-    intervention_observations = _to_2d_float_array(intervention.observations)
+    reference_observations = _to_2d_float_array(reference.observations)[:common_length]
+    intervention_observations = _to_2d_float_array(intervention.observations)[:common_length]
     if reference_observations.shape != intervention_observations.shape:
         raise ValueError("counterfactual observations must have the same shape")
     initial_difference = float(
@@ -317,8 +319,8 @@ def plot_counterfactual_comparison(
         raise ValueError("variables must be a non-empty label-to-index mapping")
     labels = list(variables)
     indices = np.asarray(list(variables.values()), dtype=int)
-    reference_values = _to_2d_float_array(reference.measurements)
-    intervention_values = _to_2d_float_array(intervention.measurements)
+    reference_values = _to_2d_float_array(reference.measurements)[:common_length]
+    intervention_values = _to_2d_float_array(intervention.measurements)[:common_length]
     if np.any(indices < 0) or np.any(indices >= reference_values.shape[1]):
         raise ValueError("variable indices reference missing measurements")
 
@@ -343,6 +345,8 @@ def plot_counterfactual_comparison(
         )
     comparison = pd.DataFrame(rows)
     comparison.attrs["initial_observation_max_difference"] = initial_difference
+    comparison.attrs["comparison_duration_hours"] = float(reference_time[-1])
+    comparison.attrs["truncated_at_first_end"] = truncated
 
     sample_indices = _tick_positions(len(reference_time), max_time_points)
     n_columns = min(2, len(indices))

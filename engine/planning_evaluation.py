@@ -14,6 +14,8 @@ import torch
 from tqdm.auto import tqdm
 
 from data.data_process import load_manifest
+from data.data_validation import (action_change_counts, matches_action_window,
+                                  model_step_seconds, validate_action_sampling)
 from engine.planning import (
     build_cem_planner,
     prepare_tep_planning_task,
@@ -94,7 +96,7 @@ def evaluate_planning_tasks(
         if executor is not None:
             executor.shutdown(wait=True, cancel_futures=True)
     if not rows:
-        raise ValueError("no planning task passed reachability screening")
+        raise ValueError(f"no planning task passed screening: {dict(runtime_rejections)}")
 
     per_task = pd.DataFrame(rows)
     threshold = float(settings.get("success_mse_threshold", 0.10))
@@ -129,27 +131,31 @@ def _build_candidates(dataset_dir, config, split):
     records = [
         record for record in load_manifest(Path(dataset_dir), split)
         if record["scenario_type"] in scenarios
-        and record.get("action_event_schedule")
+        and record.get("actual_action_event_steps")
         and not record.get("active_idvs", [])
     ]
     rng = np.random.default_rng(int(settings.get("seed", 42)))
     rng.shuffle(records)
     history = int(config["model"]["history_size"])
-    stride = int(config["training"].get("sample_stride_steps", 60))
-    sim_stride = int(settings.get("simulator_steps_per_control", 60))
-    control_steps = round(int(settings.get("goal_offset_minutes", 30)) * 60 / sim_stride)
+    stride = model_step_seconds(config["data"])
+    control_steps = int(settings["goal_offset_steps"])
+    if control_steps < 1 or control_steps != settings["goal_offset_steps"]:
+        raise ValueError("goal_offset_steps must be a positive integer")
     candidates, rejections = [], Counter()
     candidate_count = 0
     for record in records:
-        starts = sorted({round(float(event["time_hours"]) * 3600)
-                         for event in record["action_event_schedule"]})
+        if int(record["model_step_seconds"]) != stride:
+            raise ValueError("dataset model step differs from configuration")
+        starts = record["actual_action_event_steps"]
         candidate_count += len(starts)
         if record.get("outcome") not in allowed:
             rejections["disallowed_outcome"] += len(starts)
             continue
+        if any(start % stride for start in starts):
+            raise ValueError("planning action events must align with the model time grid")
         valid = [start for start in starts if
                  start - (history - 1) * stride >= 0 and
-                 start + control_steps * sim_stride < int(record["transitions"]) + 1]
+                 start + control_steps * stride < int(record["transitions"]) + 1]
         rejections["insufficient_context"] += len(starts) - len(valid)
         for start in rng.permutation(valid):
             task_id = f"{record['trajectory_id']}:{int(start)}"
@@ -181,16 +187,32 @@ def _evaluate_candidate(candidate):
     record, start, task_seed = candidate
     root, config, planner = _WORKER["root"], _WORKER["config"], _WORKER["planner"]
     settings = config.get("planning", {})
-    goal_minutes = int(settings.get("goal_offset_minutes", 30))
-    sim_stride = int(settings.get("simulator_steps_per_control", 60))
-    control_steps = round(goal_minutes * 60 / sim_stride)
+    sim_stride = model_step_seconds(config["data"])
+    control_steps = int(settings["goal_offset_steps"])
     goal = start + control_steps * sim_stride
     history = int(planner.model.history_size)
-    sample_stride = int(config["training"].get("sample_stride_steps", 60))
-    indices = start - np.arange(history - 1, -1, -1) * sample_stride
+    indices = start - np.arange(history - 1, -1, -1) * sim_stride
     with np.load(root / record["file"], allow_pickle=False) as data:
         observations = np.asarray(data["observations"], dtype=np.float32)
         actions = np.asarray(data["actions"], dtype=np.float32)
+    validate_action_sampling(actions, sim_stride)
+    previous = actions[max(start - 1, 0)]
+    reference_actions = actions[start:goal:sim_stride]
+    counts = action_change_counts(reference_actions, previous)
+    if not matches_action_window(counts, record["scenario_type"]):
+        return {"reason": "insufficient_action_changes", "row": None, "case": None}
+    preceding = np.concatenate([previous[None], reference_actions[:-1]], axis=0)
+    action_range = planner.physical_upper - planner.physical_lower
+    tolerance = 1e-6 + 1e-6 * action_range
+    reference_with_initial = np.concatenate([previous[None], reference_actions])
+    if (
+        np.any(reference_with_initial < planner.physical_lower - tolerance)
+        or np.any(reference_with_initial > planner.physical_upper + tolerance)
+        or np.any(counts > planner.max_changed_actions)
+        or np.any(np.abs(reference_actions - preceding) >
+                  planner.max_action_delta_fraction * action_range + tolerance)
+    ):
+        return {"reason": "reference_action_constraints", "row": None, "case": None}
     audit = prepare_tep_planning_task(
         config["data"], record, observations, actions, start, goal, planner.stats,
         success_threshold=float(settings.get("success_mse_threshold", 0.10)),
@@ -217,13 +239,25 @@ def _evaluate_candidate(candidate):
         "mode": int(record["mode"]), "start_step": start,
         "replay_xmeas_mse": audit["replay_mse"], "oracle_xmeas_mse": audit["oracle_mse"],
         "no_action_xmeas_mse": audit["no_action_mse"],
+        "no_action_alive": bool(audit["no_action_alive"]),
+        "no_action_soft_limit_violated": bool(audit["no_action_soft_limit_violated"]),
+        "no_action_success": bool(audit["no_action_success"]),
+        "reference_action_event_count": int(np.count_nonzero(counts)),
+        "reference_multi_sp_event_count": int(np.count_nonzero(counts >= 2)),
+        "planned_action_event_count": int(np.count_nonzero(action_change_counts(result["actions"], previous))),
+        "soft_limit_violated": bool(result["soft_limit_violated"]),
+        "control_steps": control_steps,
+        "planning_horizon": planner.horizon,
+        "elapsed_minutes": float(result["time_minutes"][-1]),
         "scenario_type": record["scenario_type"], "initial_xmeas_mse": initial,
         "final_xmeas_mse": final, "improvement": 1.0 - final / max(initial, 1e-12),
-        "success": bool(result["alive"] and final <= threshold),
+        "success": bool(result["alive"] and not result["soft_limit_violated"] and final <= threshold),
         "alive": bool(result["alive"]),
     }
     case = {
         **row, "time_minutes": np.arange(control_steps + 1) * sim_stride / 60,
+        "planned_time_minutes": result["time_minutes"],
+        "limit_violations": result["limit_violations"],
         "reference_observations": observations[reference_indices],
         "planned_observations": result["observations"],
         "reference_actions": actions[reference_indices[:-1]],
@@ -254,6 +288,12 @@ def _planning_summary(per_task: pd.DataFrame, threshold: float) -> pd.DataFrame:
         "trajectory_count": group["trajectory_id"].nunique(),
         "success_rate": group["success"].mean(),
         "shutdown_rate": 1.0 - group["alive"].mean(),
+        "soft_limit_violation_rate": group["soft_limit_violated"].mean(),
+        "no_action_success_rate": group["no_action_success"].mean(),
+        "no_action_shutdown_rate": 1.0 - group["no_action_alive"].mean(),
+        "no_action_soft_limit_violation_rate": group["no_action_soft_limit_violated"].mean(),
+        "reference_action_event_count": group["reference_action_event_count"].mean(),
+        "planned_action_event_count": group["planned_action_event_count"].mean(),
         "initial_xmeas_mse": group["initial_xmeas_mse"].mean(),
         "final_xmeas_mse": group["final_xmeas_mse"].mean(),
         "oracle_xmeas_mse": group["oracle_xmeas_mse"].mean(),

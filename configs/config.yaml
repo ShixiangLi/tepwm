@@ -1,4 +1,7 @@
 data:
+  # 唯一模型时间步配置（分钟）；仿真推进和原始记录始终为1秒。
+  # 生成的SP/工况事件、训练采样与控制执行均使用此时间网格。
+  model_step_minutes: 5
   seed: 42
   backend: python
   operating_mode: 1
@@ -13,9 +16,8 @@ data:
   action_events: []
   disturbance_events: []
 
-  # 训练数据运行边界；为空时只记录TEP自身的停车结果。
-  # 示例：{XMEAS7: [2500.0, 2900.0], XMEAS9: [110.0, 130.0]}
-  safety_limits: {}
+  # 实验软边界，用于实测超限标注和规划安全评价；不是TEP硬停车阈值。
+  safety_limits: {XMEAS9: [110.0, 129.0]}
   boundary_margin_fraction: 0.05
 
   # 示例：
@@ -66,16 +68,15 @@ data:
       test: 0.15
 
     action:
-      first_event_minutes: [30, 60]
-      hold_minutes: [45, 90]
+      first_event_minutes: [40, 60]
+      # 间隔按模型步配置；默认短保持5–15分钟、长保持30–90分钟。
+      short_hold_steps: [1, 3]
+      long_hold_steps: [6, 18]
+      short_hold_probability: 0.70
       final_context_minutes: 30
-      multi_event_count: [2, 6]
       sp_per_event: [1, 3]
       restore_probability: 0.10
-      # 少量动作采到允许范围边缘，用于形成近边界和超限样本。
-      boundary_probability: 0.02
-      boundary_band_fraction: 0.05
-      # 相对于每个SP允许范围的阶跃比例。
+      # 生成与CEM共用：每次改变的SP数上限及相邻动作最大阶跃。
       step_fraction: [0.10, 0.30]
       bounds:
         SP5: [24.0, 30.0]
@@ -90,9 +91,13 @@ data:
         SP19: [11.0, 16.0]
         SP20: [0.75, 0.90]
 
+    boundary_action:
+      # 逐步逼近并保持该SP目标；是否超限由实际XMEAS和停车结果判定。
+      targets: {SP18: 130.0}
+
     mode_switch:
       target_modes: [1, 2, 3, 4, 5, 6]
-      event_minutes: [30, 90]
+      event_minutes: [40, 90]
       final_context_minutes: 60
 
     disturbance:
@@ -101,7 +106,6 @@ data:
       start_minutes: [30, 60]
       active_minutes: [30, 120]
       final_context_minutes: 30
-      action_overlay_probability: 0.50
 
 # LeWM核心结构：状态编码器 + 动作条件自回归Transformer。
 model:
@@ -121,13 +125,9 @@ training:
   dataset_dir: datasets/tep_latest
   train_split: train
   validation_split: validation
-  # 原始数据为1秒采样；每60步取样一次，形成8分钟历史窗口。
-  sample_stride_steps: 60
-  window_stride_steps: 60
-  # 训练时轮换优化5/10/30分钟latent rollout；验证同时评估三个时域。
-  rollout_horizons: [5, 10, 30]
-  rollout_weight: 1.0
-  checkpoint_metric: rollout_loss
+  # 采样和滑窗均为一个data.model_step_minutes；区间内SP保持不变。
+  # 9个观测、8个对齐动作，默认覆盖40分钟；长度独立于规划时域。
+  # 仅优化单步latent prediction + SIGReg，以验证单步prediction loss选模型。
   preload: true
   # 单卡批量大小；有效全局批量 = batch_size × GPU数量 × 梯度累积步数。
   # 8卡H100使用256 × 8 × 1 = 2048；显卡较少时可增大累积步数保持等效批量。
@@ -153,37 +153,36 @@ evaluation:
   test_split: test
   split: validation
   scenario_types: [single_action, multi_action]
-  horizons: [1, 5, 10, 30]
+  # 训练后的递归推演诊断，单位为模型步数，不参与训练损失。
+  horizons: [1, 2, 3, 6]  # 默认对应5、10、15、30分钟。
   batch_size: 256
 
 planning:
   # 规划任务彼此独立；8卡服务器上每张GPU运行一个评估进程。
   num_workers: 8
-  horizon: 30
+  # 独立的规划时域H（模型步数，默认每步5分钟），可通过验证集选择。
+  # MPC每次调用同一个单步predictor递归H步；临近任务终点时缩短至剩余步数。
+  horizon: 6
   num_samples: 512
   num_elites: 64
   iterations: 5
   momentum: 0.10
   min_std_fraction: 0.01
   initial_std_fraction: 0.15
-  # 当前30分钟目标任务均为一次SP调整后保持；单块参数化可显著降低CEM搜索维度。
-  action_block_size: 30
-  max_changed_actions: 3
-  # 与训练数据常规动作的最大阶跃比例保持一致。
-  max_action_delta_fraction: 0.30
+  # 每个模型步可改变动作；SP数和阶跃上限读取generation.action。
+  # 平滑代价覆盖当前动作→首动作及所有相邻动作。
   action_change_weight: 0.05
   seed: 42
-  # 测试集任务：从首个动作时刻出发，以30分钟后的真实状态作为可达目标。
+  # 目标偏移以模型步计，默认6步=30分钟；与规划H可独立设置。
   validation_split: validation
   test_split: test
   split: validation
   scenario_types: [single_action, multi_action]
   num_tasks: 80
-  goal_offset_minutes: 30
-  simulator_steps_per_control: 60
-  replan_every: 5
+  goal_offset_steps: 6
+  replan_every: 1  # 每执行一个模型步重新规划，默认每5分钟一次。
   allowed_outcomes: [normal, near_boundary, recovered]
   replay_mse_threshold: 0.0001
   require_nontrivial_goal: true
-  # 未停机且最终标准化XMEAS MSE不超过该绝对阈值，记为成功。
+  # 全程未停机、未越实验软边界，且截止时刻XMEAS MSE不超过阈值。
   success_mse_threshold: 0.10
