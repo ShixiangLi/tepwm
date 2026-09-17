@@ -55,7 +55,7 @@ class Trajectory:
 
     @property
     def outcome(self) -> str:
-        """返回轨迹结局标签，如normal、boundary、violation或shutdown。"""
+        """返回轨迹结局，如normal、near_boundary、limit_exceeded或shutdown。"""
         return str(self.metadata["outcome"])
 
 

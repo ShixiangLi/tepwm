@@ -245,7 +245,7 @@ def _sample_action_events(
     allow_restore: bool = True,
     force_boundary: bool = False,
 ) -> list[dict[str, Any]]:
-    """Sample repeated SP events with short bursts and long settling intervals."""
+    """Mix dense and sparse adjustment segments, separated by settling holds."""
     config = generation["action"]
     if not (1 <= int(config["sp_per_event"][0]) <= int(config["sp_per_event"][1]) <= len(action_sps)):
         raise ValueError("invalid sp_per_event range")
@@ -253,16 +253,22 @@ def _sample_action_events(
         raise ValueError("multi_action requires at least two SPs per event")
     if not 0 < float(config["step_fraction"][0]) <= float(config["step_fraction"][1]) <= 1:
         raise ValueError("step_fraction must lie in (0, 1]")
-    probability = float(config["short_hold_probability"])
+    probability = float(config["burst_probability"])
     if not 0 <= probability <= 1:
-        raise ValueError("short_hold_probability must lie in [0, 1]")
-    for key in ("short_hold_steps", "long_hold_steps"):
-        if any(int(v) != v or v < 1 for v in config[key]):
+        raise ValueError("burst_probability must lie in [0, 1]")
+    if not 0 < config["burst_step_fraction"][0] <= config["burst_step_fraction"][1] <= config["step_fraction"][1]:
+        raise ValueError("burst_step_fraction must respect the shared maximum step size")
+    for key in ("short_hold_steps", "long_hold_steps", "burst_event_count"):
+        if (len(config[key]) != 2 or config[key][0] > config[key][1]
+            or any(int(v) != v or v < 1 for v in config[key])):
             raise ValueError(f"{key} must contain positive model-step counts")
+    if config["burst_event_count"][0] < 2:
+        raise ValueError("a burst must contain at least two action events")
     latest = duration - float(config["final_context_minutes"])
     first = config["first_event_minutes"]
-    # Reserve room for two actual events, separated by a short hold.
-    latest_first = latest - int(config["short_hold_steps"][1]) * step_seconds / 60
+    # Reserve enough room for a complete first segment of either type.
+    reserved_steps = max(config["burst_event_count"][1] - 1, config["short_hold_steps"][1])
+    latest_first = latest - reserved_steps * step_seconds / 60
     event_time = _sample_minutes([first[0], min(first[1], latest_first)], rng, step_seconds)
     current, events = dict(nominal), []
     targets = generation["boundary_action"]["targets"] if force_boundary else {}
@@ -274,7 +280,16 @@ def _sample_action_events(
             raise ValueError(f"invalid boundary target: {name}")
     if len(targets) > int(config["sp_per_event"][1]):
         raise ValueError("boundary targets exceed the simultaneous-SP limit")
+    remaining, dense = 0, False
     while event_time <= latest:
+        if remaining == 0:
+            dense = not force_boundary and rng.random() < probability
+            remaining = _randint(config["burst_event_count"], rng) if dense else 2
+            # Keep complete segments before the final response-observation period.
+            maximum_gap = 1 if dense else config["short_hold_steps"][1]
+            if event_time + (remaining - 1) * maximum_gap * step_seconds / 60 > latest:
+                break
+        step_fraction = config["burst_step_fraction"] if dense else config["step_fraction"]
         sp_count = 1 if scenario_type == "single_action" else _randint(config["sp_per_event"], rng)
         if (not events or force_boundary) and scenario_type == "multi_action":
             sp_count = max(2, sp_count)
@@ -289,35 +304,40 @@ def _sample_action_events(
         for sp in selected:
             name = f"SP{sp}"
             lower, upper = map(float, config["bounds"][name])
-            limit = float(config["step_fraction"][1]) * (upper - lower)
+            limit = float(step_fraction[1]) * (upper - lower)
             if name in targets:
                 value = current[sp] + np.clip(float(targets[name]) - current[sp], -limit, limit)
             elif allow_restore and rng.random() < float(config["restore_probability"]):
                 value = current[sp] + np.clip(nominal[sp] - current[sp], -limit, limit)
                 if np.isclose(value, current[sp]):
-                    value = _sample_action_value(config, sp, current[sp], rng)
+                    value = _sample_action_value(config, sp, current[sp], rng, step_fraction)
             else:
-                value = _sample_action_value(config, sp, current[sp], rng)
+                value = _sample_action_value(config, sp, current[sp], rng, step_fraction)
             if not np.isclose(value, current[sp], rtol=1e-6, atol=1e-6):
                 values[name] = float(value)
                 current[sp] = float(value)
         if values:
             events.append({"time_hours": event_time / 60.0, "values": values})
+            remaining -= 1
         if force_boundary and len(events) >= 2 and all(
             np.isclose(current[int(name.removeprefix("SP"))], target)
             for name, target in targets.items()
         ):
             break  # Hold the stress target for the remainder of the trajectory.
-        short = force_boundary or len(events) == 1 or rng.random() < probability
-        key = "short_hold_steps" if short else "long_hold_steps"
-        event_time += _randint(config[key], rng) * step_seconds / 60.0
+        if force_boundary:
+            gap = _randint(config["short_hold_steps"], rng)
+        elif remaining:
+            gap = 1 if dense else _randint(config["short_hold_steps"], rng)
+        else:
+            gap = _randint(config["long_hold_steps"], rng)
+        event_time += gap * step_seconds / 60.0
     return events
 
 def _sample_action_value(config: Mapping[str, Any], sp: int, current: float,
-                         rng: np.random.Generator) -> float:
+                         rng: np.random.Generator, step_fraction: Sequence[float]) -> float:
     """Sample a bounded step relative to the immediately preceding SP value."""
     lower, upper = map(float, config["bounds"][f"SP{sp}"])
-    delta = rng.uniform(*map(float, config["step_fraction"])) * (upper - lower)
+    delta = rng.uniform(*map(float, step_fraction)) * (upper - lower)
     direction = float(rng.choice((-1.0, 1.0)))
     value = float(np.clip(current + direction * delta, lower, upper))
     if np.isclose(value, current):
@@ -421,12 +441,20 @@ def _trajectory_record(plan, trajectory, quality, file_path, root) -> dict[str, 
     config = plan["config"]
     counts = action_change_counts(trajectory.actions, trajectory.metadata["initial_action"])
     event_steps = np.flatnonzero(counts)
+    stride = model_step_seconds(config)
+    longest_run = run = 0
+    previous = -2 * stride
+    for step in event_steps:
+        run = run + 1 if step - previous == stride else 1
+        longest_run = max(longest_run, run)
+        previous = step
     base_type = config.get("base_scenario_type", plan["scenario_type"])
     return {
         **{key: value for key, value in plan.items() if key != "config"},
         "base_scenario_type": base_type,
         "actual_action_event_steps": event_steps.tolist(),
         "action_event_count": int(len(event_steps)),
+        "max_consecutive_action_changes": int(longest_run),
         "multi_sp_event_count": int(np.count_nonzero(counts >= 2)),
         "action_pattern_complete": bool(matches_action_window(counts, base_type))
             if base_type in {"single_action", "multi_action"} else True,

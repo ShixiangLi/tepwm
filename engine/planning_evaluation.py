@@ -6,6 +6,7 @@ import hashlib
 import multiprocessing as mp
 from collections import Counter
 from concurrent.futures import ProcessPoolExecutor
+from itertools import zip_longest
 from pathlib import Path
 
 import numpy as np
@@ -15,11 +16,12 @@ from tqdm.auto import tqdm
 
 from data.data_process import load_manifest
 from data.data_validation import (action_change_counts, matches_action_window,
-                                  model_step_seconds, validate_action_sampling)
-from engine.planning import (
-    build_cem_planner,
+                                  model_step_seconds, validate_action_sampling,
+                                  classify_trajectory_outcome)
+from engine.planning import build_cem_planner, run_tep_mpc
+from engine.planning_tasks import (
+    execute_action_sequence,
     prepare_tep_planning_task,
-    run_tep_mpc,
     standardized_xmeas_mse,
 )
 
@@ -39,22 +41,32 @@ def evaluate_planning_tasks(
 ) -> dict:
     """Evaluate deterministic planning tasks concurrently across available GPUs."""
     settings = config.get("planning", {})
+    budget = settings["eval_budget_steps"]
+    if int(budget) != budget or budget < settings["goal_offset_steps"]:
+        raise ValueError("eval_budget_steps must cover the goal offset")
     split = split or settings.get("split", "validation")
     task_count = settings.get("num_tasks")
     task_count = None if task_count is None else int(task_count)
+    trajectory_limit = int(settings.get("max_tasks_per_trajectory", 2))
     workers = int(settings.get("num_workers", 1) if num_workers is None else num_workers)
-    if workers < 1 or (task_count is not None and task_count < 1):
-        raise ValueError("planning worker and task counts must be positive")
+    if min(workers, trajectory_limit) < 1 or (task_count is not None and task_count < 1):
+        raise ValueError("planning worker, task and per-trajectory counts must be positive")
     devices = _resolve_devices(device, workers)
     candidates, pool_info = _build_candidates(dataset_dir, config, split)
     if not candidates:
         raise ValueError("no valid held-out action trajectory is available")
+    scenarios = pool_info["scenario_types"]
+    quotas = {
+        name: task_count // len(scenarios) + (index < task_count % len(scenarios))
+        for index, name in enumerate(scenarios)
+    } if task_count is not None else {}
 
     init_args = (
         str(checkpoint_path), str(dataset_dir), config,
         planner_overrides or {}, devices,
     )
     rows, cases = [], []
+    trajectory_counts, scenario_counts = Counter(), Counter()
     runtime_rejections = Counter()
     evaluated = 0
     progress = tqdm(
@@ -74,9 +86,24 @@ def evaluate_planning_tasks(
         while cursor < len(candidates) and (
             task_count is None or len(rows) < task_count
         ):
-            remaining = len(candidates) if task_count is None else task_count - len(rows)
-            batch_size = len(candidates) if task_count is None else remaining + len(devices)
-            batch = candidates[cursor : cursor + batch_size]
+            batch = []
+            pending_trajectories, pending_scenarios = Counter(), Counter()
+            while cursor < len(candidates) and len(batch) < len(devices):
+                candidate = candidates[cursor]
+                record = candidate[0]
+                trajectory, scenario = record["trajectory_id"], record["scenario_type"]
+                if (trajectory_counts[trajectory] >= trajectory_limit or
+                        (quotas and scenario_counts[scenario] >= quotas[scenario])):
+                    cursor += 1
+                    continue
+                # Wait for pending screening results before reserving more quota.
+                if (trajectory_counts[trajectory] + pending_trajectories[trajectory] >= trajectory_limit or
+                        (quotas and scenario_counts[scenario] + pending_scenarios[scenario] >= quotas[scenario])):
+                    break
+                batch.append(candidate)
+                pending_trajectories[trajectory] += 1
+                pending_scenarios[scenario] += 1
+                cursor += 1
             results = map(_evaluate_candidate, batch) if executor is None else executor.map(
                 _evaluate_candidate, batch, chunksize=1
             )
@@ -86,11 +113,10 @@ def evaluate_planning_tasks(
                 if result["reason"]:
                     runtime_rejections[result["reason"]] += 1
                     continue
-                if task_count is not None and len(rows) >= task_count:
-                    continue
                 rows.append(result["row"])
                 cases.append(result["case"])
-            cursor += len(batch)
+                trajectory_counts[result["row"]["trajectory_id"]] += 1
+                scenario_counts[result["row"]["scenario_type"]] += 1
     finally:
         progress.close()
         if executor is not None:
@@ -113,20 +139,30 @@ def evaluate_planning_tasks(
         "devices": devices,
         "screening": {
             "candidate_count": pool_info["candidate_count"],
+            "candidate_trajectory_count": pool_info["candidate_trajectory_count"],
             "evaluated_candidate_count": evaluated,
             "accepted_count": len(rows), "rejections": dict(rejections),
+            "accepted_trajectory_count": len(trajectory_counts),
+            "requested_by_scenario": quotas,
+            "accepted_by_scenario": {name: scenario_counts[name] for name in scenarios},
+            "unfilled_by_scenario": {
+                name: quota - scenario_counts[name]
+                for name, quota in quotas.items() if scenario_counts[name] < quota
+            },
         },
     }
 
 
 def _build_candidates(dataset_dir, config, split):
-    """Build a deterministic ordered candidate pool without running simulation."""
+    """Interleave scenarios and trajectory starts with a fixed random seed."""
     settings = config.get("planning", {})
-    scenarios = set(settings.get(
+    scenarios = list(dict.fromkeys(settings.get(
         "scenario_types", config.get("evaluation", {}).get(
             "scenario_types", ["single_action", "multi_action"]
         ),
-    ))
+    )))
+    if not scenarios:
+        raise ValueError("planning scenario_types must not be empty")
     allowed = set(settings.get("allowed_outcomes", ["normal", "near_boundary", "recovered"]))
     records = [
         record for record in load_manifest(Path(dataset_dir), split)
@@ -141,7 +177,8 @@ def _build_candidates(dataset_dir, config, split):
     control_steps = int(settings["goal_offset_steps"])
     if control_steps < 1 or control_steps != settings["goal_offset_steps"]:
         raise ValueError("goal_offset_steps must be a positive integer")
-    candidates, rejections = [], Counter()
+    by_scenario = {name: [] for name in scenarios}
+    rejections = Counter()
     candidate_count = 0
     for record in records:
         if int(record["model_step_seconds"]) != stride:
@@ -157,12 +194,27 @@ def _build_candidates(dataset_dir, config, split):
                  start - (history - 1) * stride >= 0 and
                  start + control_steps * stride < int(record["transitions"]) + 1]
         rejections["insufficient_context"] += len(starts) - len(valid)
+        trajectory_candidates = []
         for start in rng.permutation(valid):
             task_id = f"{record['trajectory_id']}:{int(start)}"
             digest = hashlib.sha256(task_id.encode()).digest()
             task_seed = int(settings.get("seed", 42)) + int.from_bytes(digest[:4], "little")
-            candidates.append((record, int(start), task_seed))
-    return candidates, {"candidate_count": candidate_count, "rejections": rejections}
+            trajectory_candidates.append((record, int(start), task_seed))
+        if trajectory_candidates:
+            by_scenario[record["scenario_type"]].append(trajectory_candidates)
+    # Visit each trajectory once before considering its next randomized start.
+    ordered = [
+        [candidate for group in zip_longest(*by_scenario[name])
+         for candidate in group if candidate is not None]
+        for name in scenarios
+    ]
+    candidates = [candidate for group in zip_longest(*ordered)
+                  for candidate in group if candidate is not None]
+    return candidates, {
+        "candidate_count": candidate_count, "rejections": rejections,
+        "scenario_types": scenarios,
+        "candidate_trajectory_count": sum(len(group) for group in by_scenario.values()),
+    }
 
 
 def _initialize_worker(
@@ -188,8 +240,9 @@ def _evaluate_candidate(candidate):
     root, config, planner = _WORKER["root"], _WORKER["config"], _WORKER["planner"]
     settings = config.get("planning", {})
     sim_stride = model_step_seconds(config["data"])
-    control_steps = int(settings["goal_offset_steps"])
-    goal = start + control_steps * sim_stride
+    goal_offset = int(settings["goal_offset_steps"])
+    control_steps = int(settings["eval_budget_steps"])
+    goal = start + goal_offset * sim_stride
     history = int(planner.model.history_size)
     indices = start - np.arange(history - 1, -1, -1) * sim_stride
     with np.load(root / record["file"], allow_pickle=False) as data:
@@ -222,46 +275,85 @@ def _evaluate_candidate(candidate):
     if not audit["valid"]:
         return {"reason": audit["reason"], "row": None, "case": None}
     generator = audit.pop("generator")
+    threshold = float(settings.get("success_mse_threshold", 0.10))
+    # Continue the hold simulation already used for goal-offset screening.
+    hold = audit.pop("hold_result")
+    hold_observations = hold["observations"]
+    remaining = control_steps * sim_stride - (len(hold_observations) - 1)
+    if hold["alive"] and remaining:
+        hold = execute_action_sequence(
+            audit["hold_generator"], np.broadcast_to(previous, (remaining, len(previous))),
+        )
+        hold_observations = np.concatenate([hold_observations, hold["observations"][1:]])
+    hold_error = np.square(
+        (hold_observations[:, :41] - observations[goal, :41]) /
+        planner.stats.observation_std[:41]
+    ).mean(axis=1)
+    hold_indices = np.arange(sim_stride, len(hold_observations), sim_stride)
+    if not hold["alive"]:
+        hold_indices = hold_indices[hold_indices < len(hold_observations) - 1]
+    hold_end = len(hold_observations) - 1
+    hold_success = False
+    for index in hold_indices[hold_error[hold_indices] <= threshold]:
+        _, violations = classify_trajectory_outcome(
+            hold_observations[:index + 1], config["data"].get("safety_limits", {}),
+            shutdown=False, terminated_early=False,
+        )
+        if not any(violations.values()):
+            hold_end = int(index)
+            hold_success = True
+            break
+    hold_alive = hold_success or bool(hold["alive"])
+    _, hold_violations = classify_trajectory_outcome(
+        hold_observations[:hold_end + 1], config["data"].get("safety_limits", {}),
+        shutdown=not hold_alive, terminated_early=not hold_alive,
+    )
     planner.generator.manual_seed(task_seed)
     result = run_tep_mpc(
         generator, planner, observations[indices], actions[indices[:-1]],
         observations[goal], control_steps=control_steps,
+        goal_offset_steps=goal_offset,
         simulator_steps_per_control=sim_stride,
-        replan_every=int(settings.get("replan_every", 1)),
+        replan_every=int(settings["replan_every"]),
+        success_threshold=threshold,
     )
-    reference_indices = start + np.arange(control_steps + 1) * sim_stride
+    reference_indices = start + np.arange(goal_offset + 1) * sim_stride
     initial = standardized_xmeas_mse(observations[start], observations[goal], planner.stats)
     final = standardized_xmeas_mse(result["observations"][-1], observations[goal], planner.stats)
-    threshold = float(settings.get("success_mse_threshold", 0.10))
     row = {
         "trajectory_id": record["trajectory_id"],
         "task_id": f"{record['trajectory_id']}:{start}", "split": record["split"],
         "mode": int(record["mode"]), "start_step": start,
         "replay_xmeas_mse": audit["replay_mse"], "oracle_xmeas_mse": audit["oracle_mse"],
-        "no_action_xmeas_mse": audit["no_action_mse"],
-        "no_action_alive": bool(audit["no_action_alive"]),
-        "no_action_soft_limit_violated": bool(audit["no_action_soft_limit_violated"]),
-        "no_action_success": bool(audit["no_action_success"]),
+        "no_action_xmeas_mse": float(hold_error[hold_end]),
+        "no_action_alive": hold_alive,
+        "no_action_soft_limit_violated": any(hold_violations.values()),
+        "no_action_success": hold_success,
+        "no_action_elapsed_minutes": hold_end / 60,
         "reference_action_event_count": int(np.count_nonzero(counts)),
         "reference_multi_sp_event_count": int(np.count_nonzero(counts >= 2)),
         "planned_action_event_count": int(np.count_nonzero(action_change_counts(result["actions"], previous))),
         "soft_limit_violated": bool(result["soft_limit_violated"]),
         "control_steps": control_steps,
-        "planning_horizon": planner.horizon,
+        "goal_offset_steps": goal_offset,
+        "replan_every": int(settings["replan_every"]),
+        "planning_calls": len(result["latent_costs"]),
+        "initial_planning_horizon": int(result["planning_horizons"][0]),
         "elapsed_minutes": float(result["time_minutes"][-1]),
         "scenario_type": record["scenario_type"], "initial_xmeas_mse": initial,
         "final_xmeas_mse": final, "improvement": 1.0 - final / max(initial, 1e-12),
-        "success": bool(result["alive"] and not result["soft_limit_violated"] and final <= threshold),
+        "success": bool(result["success"]),
         "alive": bool(result["alive"]),
     }
     case = {
-        **row, "time_minutes": np.arange(control_steps + 1) * sim_stride / 60,
+        **row, "time_minutes": np.arange(goal_offset + 1) * sim_stride / 60,
         "planned_time_minutes": result["time_minutes"],
         "limit_violations": result["limit_violations"],
         "reference_observations": observations[reference_indices],
         "planned_observations": result["observations"],
         "reference_actions": actions[reference_indices[:-1]],
         "planned_actions": result["actions"], "goal_observation": observations[goal],
+        "planning_horizons": result["planning_horizons"],
         "normalization": planner.stats,
         "action_sp_numbers": tuple(config["data"]["action_sp_numbers"]),
     }
@@ -294,6 +386,8 @@ def _planning_summary(per_task: pd.DataFrame, threshold: float) -> pd.DataFrame:
         "no_action_soft_limit_violation_rate": group["no_action_soft_limit_violated"].mean(),
         "reference_action_event_count": group["reference_action_event_count"].mean(),
         "planned_action_event_count": group["planned_action_event_count"].mean(),
+        "planning_calls": group["planning_calls"].mean(),
+        "elapsed_minutes": group["elapsed_minutes"].mean(),
         "initial_xmeas_mse": group["initial_xmeas_mse"].mean(),
         "final_xmeas_mse": group["final_xmeas_mse"].mean(),
         "oracle_xmeas_mse": group["oracle_xmeas_mse"].mean(),

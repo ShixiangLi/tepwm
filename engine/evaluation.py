@@ -8,7 +8,6 @@ import torch
 from tqdm.auto import tqdm
 from data.data_process import NormalizationStats, load_manifest
 from data.data_validation import action_change_counts, matches_action_window, validate_action_sampling
-from engine.planning_evaluation import evaluate_planning_tasks
 from engine.training import load_checkpoint
 def predict_latent_trajectory(
     checkpoint_path: str | Path,
@@ -24,8 +23,8 @@ def predict_latent_trajectory(
     """Roll out one representative trajectory and return predicted/true latents."""
     if horizon < 1:
         raise ValueError("horizon must be positive")
-    device_obj = _resolve_device(device)
-    model, checkpoint = load_checkpoint(checkpoint_path, device_obj)
+    model, checkpoint = load_checkpoint(checkpoint_path, device)
+    device_obj = next(model.parameters()).device
     sample_stride_steps = int(checkpoint["training_config"]["model_step_seconds"])
     stats = NormalizationStats.from_dict(checkpoint["normalization"])
     window = _collect_windows(
@@ -74,8 +73,8 @@ def evaluate_latent_prediction(
     show_progress: bool = True,
 ) -> dict:
     """Evaluate latent MSE at selected rollout horizons on held-out trajectories."""
-    device_obj = _resolve_device(device)
-    model, checkpoint = load_checkpoint(checkpoint_path, device_obj)
+    model, checkpoint = load_checkpoint(checkpoint_path, device)
+    device_obj = next(model.parameters()).device
     sample_stride_steps = int(checkpoint["training_config"]["model_step_seconds"])
     stats = NormalizationStats.from_dict(checkpoint["normalization"])
     history_size = int(model.history_size)
@@ -219,9 +218,3 @@ def _summarize(per_window: pd.DataFrame) -> pd.DataFrame:
         "latent_mse_std", "window_count",
     ]
     return summary
-def _resolve_device(value: str) -> torch.device:
-    """Resolve an auto/cpu/cuda evaluation device."""
-    if value == "auto": value = "cuda" if torch.cuda.is_available() else "cpu"
-    if value.startswith("cuda") and not torch.cuda.is_available():
-        raise RuntimeError("CUDA was requested but is unavailable")
-    return torch.device(value)

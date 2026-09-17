@@ -166,9 +166,9 @@ def plot_planning_case(
         np.nanpercentile(np.abs(planned_action_z), 98),
     )
     labels = [f"SP{number}" for number in case["action_sp_numbers"]]
-    for axis, values, title in (
-        (axes[1, 0], reference_action_z, "Reference Actions"),
-        (axes[1, 1], planned_action_z, "CEM-MPC Actions"),
+    for axis, values, time, title in (
+        (axes[1, 0], reference_action_z, reference_time, "Reference Actions"),
+        (axes[1, 1], planned_action_z, planned_time, "CEM-MPC Actions"),
     ):
         sns.heatmap(
             values.T, cmap="vlag", center=0, vmin=-limit, vmax=limit,
@@ -176,7 +176,7 @@ def plot_planning_case(
             ax=axis,
         )
         ticks = np.unique(np.linspace(0, len(values) - 1, min(7, len(values)), dtype=int))
-        axis.set_xticks(ticks + 0.5, [f"{reference_time[i]:g}" for i in ticks])
+        axis.set_xticks(ticks + 0.5, [f"{time[i]:g}" for i in ticks])
         axis.set(title=title, xlabel="Time after planning start (min)", ylabel="")
     for axis in axes[0]:
         axis.grid(True, alpha=0.25)

@@ -33,7 +33,10 @@ def train_world_model(
     """Train TEP-LeWM on one device or under torchrun DistributedDataParallel."""
     training = dict(config["training"])
     model_config = dict(config["model"])
+    project_root = Path(__file__).resolve().parents[1]
     dataset_path = Path(dataset_dir or training["dataset_dir"])
+    if dataset_dir is None and not dataset_path.is_absolute():
+        dataset_path = project_root / dataset_path
     summary_path = dataset_path / "summary.json"
     dataset_summary = (
         json.loads(summary_path.read_text(encoding="utf-8"))
@@ -116,6 +119,8 @@ def train_world_model(
     )
 
     output_dir = Path(training.get("output_dir", "checkpoints/tep_lewm"))
+    if not output_dir.is_absolute():
+        output_dir = project_root / output_dir
     if is_main:
         output_dir.mkdir(parents=True, exist_ok=True)
     if distributed:
@@ -209,6 +214,7 @@ def load_checkpoint(
     path: str | Path, device: str | torch.device = "cpu"
 ) -> tuple[torch.nn.Module, dict[str, Any]]:
     """Restore a trained TEP LeWM and return its complete checkpoint metadata."""
+    device = _resolve_device(str(device))
     checkpoint = torch.load(path, map_location=device, weights_only=False)
     model = build_tep_lewm(checkpoint["model_config"])
     model.load_state_dict(checkpoint["model_state"])

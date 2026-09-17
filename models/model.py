@@ -111,7 +111,7 @@ class TEPLeWM(nn.Module):
             past = action_history[:, None].expand(-1, samples, -1, -1)
             result = self._rollout_flat(
                 history.reshape(batch * samples, history.size(2), -1),
-                past.reshape(batch * samples, past.size(2), -1),
+                past.reshape(batch * samples, past.size(2), past.size(3)),
                 future_actions.reshape(batch * samples, horizon, action_dim),
             )
             return result.reshape(batch, samples, horizon, self.latent_dim)
@@ -138,12 +138,11 @@ class TEPLeWM(nn.Module):
                 context_embeddings, self.encode_actions(context_actions[:, -history:])
             )[:, -1:]
             predictions.append(predicted)
-            embeddings = torch.cat([embeddings, predicted], dim=1)
-            past_actions = torch.cat([past_actions, action], dim=1)
-            if history > 1:
-                past_actions = past_actions[:, -(history - 1) :]
-            else:
-                past_actions = past_actions[:, :0]
+            embeddings = torch.cat([embeddings, predicted], dim=1)[:, -history:]
+            past_actions = (
+                context_actions[:, -(history - 1):] if history > 1
+                else context_actions[:, :0]
+            )
         return torch.cat(predictions, dim=1)
 
     def goal_cost(

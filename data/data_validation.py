@@ -169,30 +169,6 @@ def classify_trajectory_outcome(
     return outcome, violations
 
 
-def summarize_action_coverage(
-    trajectories: Sequence[Trajectory],
-    expected_sp_numbers: Sequence[int] = DEFAULT_ACTION_SP_NUMBERS,
-) -> dict[str, Any]:
-    """在数据集层面统计每个动作SP的变化次数和总体覆盖率。"""
-    expected = tuple(int(number) for number in expected_sp_numbers)
-    if not expected or len(set(expected)) != len(expected):
-        raise ValueError("expected_sp_numbers must be non-empty and unique")
-    counts = {number: 0 for number in expected}
-    for trajectory in trajectories:
-        for number in trajectory.metadata.get("changed_action_sp_numbers", ()):
-            if number in counts:
-                counts[number] += 1
-    covered = [number for number, count in counts.items() if count]
-    missing = [number for number, count in counts.items() if not count]
-    return {
-        "trajectory_count": len(trajectories),
-        "counts": counts,
-        "covered_sp_numbers": covered,
-        "missing_sp_numbers": missing,
-        "coverage_ratio": len(covered) / len(expected),
-    }
-
-
 def audit_dataset(
     dataset_dir: str | Path,
     expected_sp_numbers: Sequence[int] = DEFAULT_ACTION_SP_NUMBERS,

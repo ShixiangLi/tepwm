@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -14,11 +13,11 @@ def plot_training_history(
     history: str | Path | pd.DataFrame,
     *,
     sigreg_weight: float = 0.09,
-    search_roots: Sequence[str | Path] = (),
+    checkpoint_epoch: int | None = None,
     figsize: tuple[float, float] = (14, 4.5),
 ):
-    """Plot total and component losses and return the best validation result."""
-    frame = _load_history(history, search_roots)
+    """Distinguish the minimum validation loss from the saved checkpoint epoch."""
+    frame = _load_history(history)
     required = {
         "epoch", "train_loss", "validation_loss",
         "train_prediction_loss", "validation_prediction_loss",
@@ -31,21 +30,32 @@ def plot_training_history(
         raise ValueError("sigreg_weight must be non-negative")
 
     selection_column = "validation_prediction_loss"
-    best = frame.loc[frame[selection_column].idxmin()]
+    minimum = frame.loc[frame[selection_column].idxmin()]
     summary = {
-        "best_epoch": int(best["epoch"]),
+        "minimum_validation_epoch": int(minimum["epoch"]),
+        "minimum_validation_prediction_loss": float(minimum[selection_column]),
         "checkpoint_metric": selection_column,
-        "best_checkpoint_metric": float(best[selection_column]),
-        "best_validation_loss": float(best["validation_loss"]),
-        "best_validation_prediction_loss": float(best["validation_prediction_loss"]),
     }
+    if checkpoint_epoch is not None:
+        selected = frame.loc[frame["epoch"] == checkpoint_epoch]
+        if len(selected) != 1:
+            raise ValueError("checkpoint_epoch must identify one row in training history")
+        summary.update(
+            checkpoint_epoch=int(checkpoint_epoch),
+            checkpoint_validation_prediction_loss=float(selected.iloc[0][selection_column]),
+        )
     figure, axes = plt.subplots(1, 2, figsize=figsize)
     _line(axes[0], frame, "train_loss", "Train")
     _line(axes[0], frame, "validation_loss", "Validation")
     axes[0].axvline(
-        summary["best_epoch"], color="#D55E00", linestyle="--", alpha=0.8,
-        label=f"Best epoch: {summary['best_epoch']}",
+        minimum["epoch"], color="#009E73", linestyle=":", alpha=0.8,
+        label=f"Minimum validation loss: {int(minimum['epoch'])}",
     )
+    if checkpoint_epoch is not None:
+        axes[0].axvline(
+            checkpoint_epoch, color="#D55E00", linestyle="--", alpha=0.8,
+            label=f"Saved checkpoint: {checkpoint_epoch}",
+        )
     axes[0].set(title="Total Training Objective", xlabel="Epoch", ylabel="Loss")
 
     components = (
@@ -68,22 +78,14 @@ def plot_training_history(
     return summary, figure, axes
 
 
-def _load_history(
-    history: str | Path | pd.DataFrame, search_roots: Sequence[str | Path]
-) -> pd.DataFrame:
-    """Load a history table, resolving either a JSON file or output directory."""
+def _load_history(history: str | Path | pd.DataFrame) -> pd.DataFrame:
+    """Load an explicit history file, output directory or in-memory table."""
     if isinstance(history, pd.DataFrame):
         return history.copy()
     path = Path(history)
     if path.suffix.lower() != ".json":
         path /= "history.json"
-    candidates = [path]
-    if not path.is_absolute():
-        candidates.extend(Path(root) / path for root in search_roots)
-    resolved = next((candidate for candidate in candidates if candidate.is_file()), None)
-    if resolved is None:
-        raise FileNotFoundError(f"training history not found; checked: {candidates}")
-    return pd.read_json(resolved)
+    return pd.read_json(path)
 
 
 def _line(axis, frame: pd.DataFrame, column: str, label: str) -> None:
