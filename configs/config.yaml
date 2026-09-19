@@ -181,7 +181,7 @@ planning:
   max_tasks_per_trajectory: 2  # 场景均分任务名额，按轨迹轮流抽取；每条轨迹最多2个任务。
   goal_offset_steps: 18
   eval_budget_steps: 20  # 100分钟预算；到目标时刻后，以1步时域继续反馈。
-  replan_every: 5  # 最多执行5步；距目标不足5步时在目标时刻提前重规划。
+  replan_every: 1  # 每执行1个模型步（5分钟）后用真实观测重规划。
   allowed_outcomes: [normal, near_boundary, recovered]
   replay_mse_threshold: 0.0001
   require_nontrivial_goal: true

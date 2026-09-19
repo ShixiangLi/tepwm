@@ -201,7 +201,7 @@ def run_tep_mpc(
     goal_offset_steps: int,
     control_steps: int,
     simulator_steps_per_control: int,
-    replan_every: int = 5,
+    replan_every: int = 1,
     success_threshold: float = 0.10,
 ) -> dict[str, np.ndarray | bool]:
     """Replan to the remaining goal time and hold SP between feedback updates."""
